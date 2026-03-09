@@ -1,12 +1,12 @@
 """
-Statistics GUI for Greedy Cat Result Logger v10
+Statistics GUI for Greedy Cat Result Logger v11
 Shows history as game icons, hot/cold items, percentages, streaks.
 Dark theme matching reference software style.
 
-v10: Capture verification dialog — tests if screen capture works before
-     monitoring starts. Auto-switches to pyautogui fallback if mss returns
-     black images (common with DirectX/OpenGL emulators like BlueStacks).
-     Auto-saves first 20 scans for diagnostics.
+v11: Comprehensive diagnostics — ALL errors visible in GUI log panel.
+     Every scan writes to diagnostic log + log file.
+     Capture stats (mean brightness, std deviation) shown per scan.
+     Errors no longer hidden in console.
 """
 
 import tkinter as tk
@@ -15,7 +15,9 @@ import os
 import threading
 import time
 import json
+import traceback
 import cv2
+import numpy as np
 from datetime import datetime
 from PIL import Image, ImageTk
 from config import FOOD_ITEMS, FOOD_DISPLAY, FOOD_MULTIPLIER, TEMPLATES_DIR
@@ -50,6 +52,11 @@ class StatsGUI:
         self.scan_count = 0
         self.predictor = Predictor()
 
+        # Diagnostic log
+        self.log_buffer = []
+        self.log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "greedy_cat.log")
+        self.baseline_crop = None  # Saved during calibration for change detection
+
         # Icon image cache
         self.icons = {}  # {food_name: {size: PhotoImage}}
 
@@ -70,6 +77,18 @@ class StatsGUI:
         self._build_gui()
         self._refresh_stats()
         self._update_calibration_status()
+
+        # Log startup info
+        self._log("="*50)
+        self._log("Greedy Cat Result Logger v11 STARTED")
+        self._log(f"Detector: {len(self.detector.templates) if self.detector else 0} templates loaded")
+        self._log(f"Capturer: {'available' if self.capturer else 'NOT available'}")
+        ix = self.settings.get("icon_center_x", 0)
+        iy = self.settings.get("icon_center_y", 0)
+        if ix > 0 and iy > 0:
+            self._log(f"Calibration: icon at ({ix}, {iy})")
+        else:
+            self._log("Calibration: NOT SET — click Calibrate first", "WARN")
 
     def _load_settings(self):
         """Load saved settings."""
@@ -93,6 +112,49 @@ class StatsGUI:
         try:
             with open(self.config_path, 'w') as f:
                 json.dump(self.settings, f, indent=2)
+        except Exception:
+            pass
+
+    def _log(self, message, level="INFO"):
+        """Write to diagnostic log (GUI panel + file). Thread-safe."""
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        entry = f"[{timestamp}] {level}: {message}"
+        self.log_buffer.append(entry)
+        if len(self.log_buffer) > 300:
+            self.log_buffer = self.log_buffer[-200:]
+        # Write to log file
+        try:
+            with open(self.log_file, 'a') as f:
+                f.write(entry + "\n")
+        except Exception:
+            pass
+        # Also print to console for debugging
+        print(entry)
+        # Schedule GUI update (thread-safe)
+        try:
+            self.root.after(0, self._update_log_display)
+        except Exception:
+            pass
+
+    def _update_log_display(self):
+        """Update the diagnostic log text widget with color-coded entries."""
+        if not hasattr(self, 'log_text'):
+            return
+        try:
+            self.log_text.config(state="normal")
+            self.log_text.delete("1.0", "end")
+            # Show last 50 entries with color coding
+            for entry in self.log_buffer[-50:]:
+                tag = "INFO"
+                if "ERROR" in entry:
+                    tag = "ERROR"
+                elif "WARN" in entry:
+                    tag = "WARN"
+                elif "DETECT" in entry or "DETECTED" in entry:
+                    tag = "DETECT"
+                self.log_text.insert("end", entry + "\n", tag)
+            self.log_text.see("end")
+            self.log_text.config(state="disabled")
         except Exception:
             pass
 
@@ -173,6 +235,7 @@ class StatsGUI:
         self._build_hot_cold()
         self._build_stats_table()
         self._build_result_history()
+        self._build_diagnostic_log()
         self._build_status_bar()
 
     # ===================== HEADER =====================
@@ -639,6 +702,49 @@ class StatsGUI:
         hsb.pack(side="right", fill="y")
         self.history_text.pack(fill="both", expand=True)
 
+    # ===================== DIAGNOSTIC LOG =====================
+    def _build_diagnostic_log(self):
+        """Visible log panel showing what the program is doing in real-time."""
+        section = tk.Frame(self.main_frame, bg=self.BG_COLOR)
+        section.pack(fill="x", padx=10, pady=4)
+
+        hdr = tk.Frame(section, bg=self.BG_COLOR)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="DIAGNOSTIC LOG",
+                 font=("Segoe UI", 10, "bold"), fg="#d29922",
+                 bg=self.BG_COLOR, anchor="w").pack(side="left")
+        tk.Label(hdr, text="(all scan activity shown here — errors in RED)",
+                 font=("Segoe UI", 8), fg=self.TEXT_DIM,
+                 bg=self.BG_COLOR).pack(side="left", padx=8)
+
+        log_frame = tk.Frame(section, bg="#0d1117", padx=4, pady=4)
+        log_frame.pack(fill="x")
+        log_frame.pack_propagate(False)
+        log_frame.config(height=180)
+
+        self.log_text = tk.Text(
+            log_frame, bg="#0d1117", fg="#8b949e",
+            font=("Consolas", 8), relief="flat", wrap="word",
+            state="disabled", insertbackground="#8b949e",
+            selectbackground="#264f78"
+        )
+        log_sb = tk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_sb.set)
+        log_sb.pack(side="right", fill="y")
+        self.log_text.pack(fill="both", expand=True)
+
+        # Color tags for log levels
+        self.log_text.tag_configure("ERROR", foreground="#f85149")
+        self.log_text.tag_configure("WARN", foreground="#d29922")
+        self.log_text.tag_configure("DETECT", foreground="#3fb950")
+        self.log_text.tag_configure("INFO", foreground="#8b949e")
+
+        # Log file location note
+        tk.Label(section,
+                 text=f"Log file: {self.log_file}",
+                 font=("Segoe UI", 7), fg="#484f58", bg=self.BG_COLOR,
+                 anchor="w").pack(fill="x")
+
     # ===================== STATUS BAR =====================
     def _build_status_bar(self):
         status = tk.Frame(self.main_frame, bg="#010409", pady=4)
@@ -994,6 +1100,18 @@ class StatsGUI:
             self.status_label.config(
                 text=f"Calibrated: icon at ({ix}, {iy}), crop {crop_size}x{crop_size}px",
                 fg=self.GREEN)
+            self._log(f"Calibration set: icon at ({ix}, {iy}), crop {crop_size}px")
+
+            # Save baseline crop (what area looks like right now)
+            half_b = crop_size // 2
+            bx = max(half_b, min(ix, sw - half_b))
+            by = max(half_b, min(iy, sh - half_b))
+            self.baseline_crop = full_screen[by - half_b:by + half_b, bx - half_b:bx + half_b].copy()
+            debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
+            os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(debug_dir, "baseline.png"), self.baseline_crop)
+            self._log(f"Baseline saved to debug_captures/baseline.png")
+
             cal_win.destroy()
 
             messagebox.showinfo("Calibration Complete",
@@ -1064,11 +1182,22 @@ class StatsGUI:
         self.status_label.config(text="Testing capture methods...", fg="#d29922")
         self.root.update_idletasks()
 
+        self._log(f"Verifying capture at ({x},{y}) {crop_size}x{crop_size}...")
+
         # Test both capture methods
         results = self.capturer.test_capture_methods(x, y, crop_size, crop_size)
 
         mss_img, mss_valid = results["mss"]
         pyag_img, pyag_valid = results["pyautogui"]
+
+        # Log capture test results
+        for name, (img, valid) in results.items():
+            if img is not None:
+                g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                self._log(f"  {name}: {'VALID' if valid else 'INVALID'} "
+                          f"(mean={np.mean(g):.0f}, std={np.std(g):.1f})")
+            else:
+                self._log(f"  {name}: FAILED (returned None)", "ERROR")
 
         # Save both for diagnostics
         debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
@@ -1216,6 +1345,7 @@ class StatsGUI:
             self.btn_monitor.config(text=" START MONITORING", bg="#238636")
             self.status_label.config(text="Stopped", fg=self.TEXT_DIM)
             self.preview_row.pack_forget()
+            self._log("Monitoring STOPPED by user")
         else:
             # Check calibration
             ix = self.settings.get("icon_center_x", 0)
@@ -1235,18 +1365,26 @@ class StatsGUI:
                     "No icon templates loaded!\nAdd images to the 'templates/' folder.")
                 return
 
+            self._log("Starting monitoring...")
+            self._log(f"Calibration: icon at ({ix}, {iy}), crop {self.settings.get('crop_size')}px")
+            self._log(f"Templates loaded: {len(self.detector.templates) if self.detector else 0}")
+
             # Verify capture works before starting
             if not self._verify_capture():
                 self.status_label.config(text="Monitoring cancelled", fg=self.TEXT_DIM)
+                self._log("Monitoring cancelled (capture verification failed)", "WARN")
                 return
 
             # Apply settings to detector
             if self.detector:
                 debug = self.settings.get("debug_saves", False)
                 self.detector.debug_enabled = debug
-                self.detector.save_all_scans = debug  # Save all scans when debug is ON
+                self.detector.save_all_scans = debug
                 self.detector.popup_active = False
                 self.detector.consecutive_no_match = 0
+
+            # Reset scan count for this session
+            self.scan_count = 0
 
             # Show live preview
             self.preview_row.pack(fill="x", pady=(4, 0))
@@ -1255,16 +1393,35 @@ class StatsGUI:
             self.btn_monitor.config(text=" STOP MONITORING", bg="#da3633")
             self.status_label.config(
                 text="MONITORING - Watching for results...", fg=self.GREEN)
+            self._log("Monitoring STARTED — scan loop beginning")
             self._start_monitor_thread()
 
     def _start_monitor_thread(self):
         def loop():
+            self._log("Monitor thread STARTED")
+            self._log(f"Capture method: {'pyautogui' if self.capturer.use_fallback else 'mss'}")
+            self._log(f"Calibration: ({self.settings.get('icon_center_x')}, "
+                       f"{self.settings.get('icon_center_y')}), "
+                       f"crop {self.settings.get('crop_size')}px")
+            scan_errors = 0
             while self.monitoring:
                 try:
                     self._scan_once()
+                    scan_errors = 0  # Reset on success
                 except Exception as e:
-                    print(f"Scan error: {e}")
-                time.sleep(self.settings.get("interval", 1.5))
+                    scan_errors += 1
+                    self._log(f"SCAN EXCEPTION #{scan_errors}: {type(e).__name__}: {e}", "ERROR")
+                    # Log full traceback for first 3 errors
+                    if scan_errors <= 3:
+                        self._log(traceback.format_exc(), "ERROR")
+                    if scan_errors >= 10:
+                        self._log("Too many scan errors (10+), stopping monitor", "ERROR")
+                        self.monitoring = False
+                        self.root.after(0, lambda: self.btn_monitor.config(
+                            text=" START MONITORING", bg="#238636"))
+                        break
+                time.sleep(self.settings.get("interval", 1.0))
+            self._log("Monitor thread STOPPED")
         self.monitor_thread = threading.Thread(target=loop, daemon=True)
         self.monitor_thread.start()
 
@@ -1273,8 +1430,11 @@ class StatsGUI:
         Capture the small calibrated crop and detect the food icon.
         State-machine approach: always tries to identify, logs once per popup.
         Updates the live preview with every scan.
+        ALL steps are logged to the diagnostic panel.
         """
         if not self.capturer or not self.detector:
+            self._log("SKIP: capturer=%s detector=%s" % (
+                self.capturer is not None, self.detector is not None), "WARN")
             return
 
         ix = self.settings.get("icon_center_x", 0)
@@ -1282,18 +1442,39 @@ class StatsGUI:
         crop_size = self.settings.get("crop_size", 150)
 
         if ix == 0 or iy == 0:
+            self._log("SKIP: not calibrated (ix=%d, iy=%d)" % (ix, iy), "WARN")
             return
 
         # Capture a small region centered on the calibrated icon position
         half = crop_size // 2
-        crop = self.capturer.capture_region(
-            ix - half, iy - half, crop_size, crop_size)
+        cap_x, cap_y = ix - half, iy - half
+
+        crop = self.capturer.capture_region(cap_x, cap_y, crop_size, crop_size)
 
         if crop is None:
-            self.root.after(0, lambda: self.diag_label.config(text="Capture failed"))
+            method = "pyautogui" if self.capturer.use_fallback else "mss"
+            self._log(f"Capture FAILED (None) at ({cap_x},{cap_y}) {crop_size}x{crop_size} via {method}", "ERROR")
+            self.root.after(0, lambda: self.diag_label.config(text="Capture failed!"))
             return
 
         self.scan_count += 1
+
+        # Log capture stats
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        mean_val = np.mean(gray)
+        std_val = np.std(gray)
+        method = "pyautogui" if self.capturer.use_fallback else "mss"
+
+        # Compare with baseline to detect changes
+        change_pct = 0
+        if self.baseline_crop is not None:
+            try:
+                base_gray = cv2.cvtColor(self.baseline_crop, cv2.COLOR_BGR2GRAY)
+                if base_gray.shape == gray.shape:
+                    diff = cv2.absdiff(gray, base_gray)
+                    change_pct = float(np.mean(diff))
+            except Exception:
+                pass
 
         # Auto-save first 20 scans for diagnostics (always, no checkbox needed)
         if self.scan_count <= 20:
@@ -1301,16 +1482,33 @@ class StatsGUI:
             os.makedirs(debug_dir, exist_ok=True)
             cv2.imwrite(os.path.join(debug_dir, f"auto_scan_{self.scan_count:03d}.png"), crop)
 
+        # Warn about potentially invalid capture
+        change_str = f" change={change_pct:.1f}" if self.baseline_crop is not None else ""
+        if std_val < 5:
+            self._log(f"Scan #{self.scan_count}: BLACK/UNIFORM image! "
+                      f"mean={mean_val:.0f} std={std_val:.1f}{change_str} via {method}", "ERROR")
+        elif self.scan_count <= 5 or self.scan_count % 10 == 0:
+            # Log first 5 scans and every 10th after
+            self._log(f"Scan #{self.scan_count}: {crop.shape[1]}x{crop.shape[0]} "
+                      f"mean={mean_val:.0f} std={std_val:.1f}{change_str} via {method}")
+
         # Save crop for preview (thread-safe: just save reference)
         self.latest_crop = crop.copy()
 
         # Run detection (state machine handles logging logic)
         food_name, confidence = self.detector.scan_crop(crop)
 
+        # Log detection result
+        det_info = self.detector.last_scan_info
+        if food_name:
+            self._log(f"DETECTED: {food_name} ({confidence:.0%}) — {det_info}", "DETECT")
+        elif self.scan_count <= 5:
+            self._log(f"Scan #{self.scan_count}: {det_info}")
+
         # Update preview and diagnostics on main thread
         self.root.after(0, self._update_preview)
-        diag_text = self.detector.last_scan_info
-        self.root.after(0, lambda t=diag_text: self.diag_label.config(text=t))
+        self.root.after(0, lambda t=det_info: self.diag_label.config(text=t))
+        self.root.after(0, lambda: self.scan_label.config(text=f"Scans: {self.scan_count}"))
 
         if food_name:
             self.logger.add_result(food_name, confidence=confidence)
@@ -1421,7 +1619,6 @@ class StatsGUI:
                 cv2.imwrite(path, img)
                 result_msg += f"  Size: {img.shape[1]}x{img.shape[0]}\n"
 
-                import numpy as np
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 result_msg += f"  Mean brightness: {np.mean(gray):.1f}\n"
                 result_msg += f"  Std deviation: {np.std(gray):.1f}\n"
