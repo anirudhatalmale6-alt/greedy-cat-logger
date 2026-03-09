@@ -1,11 +1,12 @@
 """
-Statistics GUI for Greedy Cat Result Logger v14
+Statistics GUI for Greedy Cat Result Logger v15
 Shows history as game icons, hot/cold items, percentages, streaks.
 Dark theme matching reference software style.
 
-v14: Stability-based detection — prevents detecting spinning wheel icons.
-     Requires same food matched 3x consecutive + image pixel stability.
-     Only logs when popup is truly static on screen.
+v15: POPUP PRESENCE DETECTION — the root fix for wheel false detections.
+     Before food detection, compares crop BACKGROUND to calibration baseline.
+     If background doesn't match popup appearance → skip (it's the wheel).
+     Only detects food when popup overlay is confirmed present.
 """
 
 import tkinter as tk
@@ -54,7 +55,9 @@ class StatsGUI:
         # Diagnostic log
         self.log_buffer = []
         self.log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "greedy_cat.log")
-        self.baseline_crop = None  # Saved during calibration for change detection
+        self.baseline_crop = None  # Saved during calibration for popup presence detection
+        self.popup_correlation_threshold = 0.35  # Min correlation to consider popup present
+        self.last_popup_corr = 0.0  # Last popup correlation score
 
         # Icon image cache
         self.icons = {}  # {food_name: {size: PhotoImage}}
@@ -79,7 +82,7 @@ class StatsGUI:
 
         # Log startup info
         self._log("="*50)
-        self._log("Greedy Cat Result Logger v14 STARTED")
+        self._log("Greedy Cat Result Logger v15 STARTED")
         self._log(f"Detector: {len(self.detector.templates) if self.detector else 0} templates loaded")
         self._log(f"Capturer: {'available' if self.capturer else 'NOT available'}")
         ix = self.settings.get("icon_center_x", 0)
@@ -427,29 +430,32 @@ class StatsGUI:
                 stable_frames = self.detector.stable_frame_count
                 req_stable = self.detector.required_stable_frames
 
-                if consec >= req and stable_frames >= req_stable:
-                    stab_color = self.GREEN
-                    stab_text = f"STABLE: {consec_food} x{consec}/{req} | img stable x{stable_frames} (diff={img_diff:.1f})"
-                elif img_diff > self.detector.image_stability_threshold:
+                popup_corr = self.last_popup_corr
+                popup_thresh = self.popup_correlation_threshold
+
+                if popup_corr < popup_thresh:
                     stab_color = self.RED
-                    stab_text = f"SPINNING: diff={img_diff:.1f} | {consec_food} x{consec}/{req}"
+                    stab_text = f"NO POPUP (corr={popup_corr:.2f} < {popup_thresh}) — wheel/game visible"
+                elif consec >= req and stable_frames >= req_stable:
+                    stab_color = self.GREEN
+                    stab_text = f"POPUP+STABLE: x{consec}/{req} | popup={popup_corr:.2f} | diff={img_diff:.1f}"
                 else:
                     stab_color = "#d29922"
-                    stab_text = f"Building: {consec_food} x{consec}/{req} | diff={img_diff:.1f} stable={stable_frames}/{req_stable}"
+                    stab_text = f"POPUP(corr={popup_corr:.2f}) | {consec_food} x{consec}/{req} | diff={img_diff:.1f}"
 
                 self.preview_gap_label.config(text=stab_text, fg=stab_color)
             else:
                 self.preview_match_label.config(
                     text="Best match: --", fg=self.TEXT_DIM)
-                img_diff = self.detector.last_image_diff
-                if img_diff > self.detector.image_stability_threshold:
+                popup_corr = self.last_popup_corr
+                if popup_corr < self.popup_correlation_threshold:
                     self.preview_gap_label.config(
-                        text=f"SPINNING: diff={img_diff:.1f} — waiting for popup",
+                        text=f"NO POPUP (corr={popup_corr:.2f}) — waiting for result popup",
                         fg=self.RED)
                 else:
                     self.preview_gap_label.config(
-                        text=f"No match | diff={img_diff:.1f}",
-                        fg=self.TEXT_DIM)
+                        text=f"Popup visible (corr={popup_corr:.2f}) but no food match",
+                        fg="#d29922")
 
             # State
             state = self.detector.last_scan_info
@@ -1432,7 +1438,12 @@ class StatsGUI:
             self.btn_monitor.config(text=" STOP MONITORING", bg="#da3633")
             self.status_label.config(
                 text="MONITORING - Watching for results...", fg=self.GREEN)
-            self._log("Monitoring STARTED — scan loop beginning")
+            self._log("Monitoring STARTED — popup presence detection active")
+            self._log(f"Popup correlation threshold: {self.popup_correlation_threshold}")
+            if self.baseline_crop is not None:
+                self._log("Calibration baseline loaded — will verify popup presence each scan")
+            else:
+                self._log("WARNING: No calibration baseline — popup detection disabled", "WARN")
             self._start_monitor_thread()
 
     def _start_monitor_thread(self):
@@ -1464,12 +1475,81 @@ class StatsGUI:
         self.monitor_thread = threading.Thread(target=loop, daemon=True)
         self.monitor_thread.start()
 
+    def _check_popup_presence(self, gray_crop):
+        """
+        Check if the result popup is currently visible by comparing the
+        BACKGROUND region of the current crop to the calibration baseline.
+
+        The calibration baseline was captured WITH the popup visible.
+        When the popup is present, the background (border, text overlay, etc.)
+        matches the baseline. When just the wheel is showing, it looks different.
+
+        We mask out the CENTER of the crop (where the food icon is, which
+        changes each round) and only compare the surrounding background pixels.
+
+        Returns: (popup_present: bool, correlation: float)
+        """
+        if self.baseline_crop is None:
+            return True, 1.0  # No baseline, assume popup present (fallback)
+
+        try:
+            base_gray = cv2.cvtColor(self.baseline_crop, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return True, 1.0
+
+        if base_gray.shape != gray_crop.shape:
+            return True, 1.0
+
+        h, w = gray_crop.shape[:2]
+
+        # Create a mask that EXCLUDES the center 40% (food icon area)
+        # and only keeps the border/background region
+        mask = np.ones((h, w), dtype=np.uint8)
+        center_size = int(min(h, w) * 0.4)
+        ch, cw = h // 2, w // 2
+        half_cs = center_size // 2
+        mask[ch - half_cs:ch + half_cs, cw - half_cs:cw + half_cs] = 0
+
+        # Extract only the border pixels
+        border_current = gray_crop[mask == 1].astype(np.float64)
+        border_baseline = base_gray[mask == 1].astype(np.float64)
+
+        if len(border_current) == 0:
+            return True, 1.0
+
+        # Compute normalized correlation of border pixels
+        curr_mean = np.mean(border_current)
+        base_mean = np.mean(border_baseline)
+        curr_std = np.std(border_current)
+        base_std = np.std(border_baseline)
+
+        if curr_std < 1 or base_std < 1:
+            # One is nearly uniform — use mean brightness difference
+            mean_diff = abs(curr_mean - base_mean)
+            return mean_diff < 30, 1.0 - (mean_diff / 255.0)
+
+        # Pearson correlation on border pixels
+        corr = np.corrcoef(border_current, border_baseline)[0, 1]
+        if np.isnan(corr):
+            corr = 0.0
+
+        # Popup is present if correlation is high (background matches baseline)
+        popup_present = corr >= self.popup_correlation_threshold
+        return popup_present, corr
+
     def _scan_once(self):
         """
-        Capture the small calibrated crop and detect the food icon.
-        State-machine approach: always tries to identify, logs once per popup.
-        Updates the live preview with every scan.
-        ALL steps are logged to the diagnostic panel.
+        v15: Popup-presence-gated detection.
+
+        Before trying food detection, checks if the popup is actually visible
+        by comparing the crop's background to the calibration baseline.
+        This prevents detecting food icons on the wheel/game UI.
+
+        Steps:
+        1. Capture crop at calibrated position
+        2. CHECK POPUP PRESENCE (background correlation with baseline)
+        3. Only if popup is present → run food detection + stability checks
+        4. If no popup → skip (log "No popup")
         """
         if not self.capturer or not self.detector:
             self._log("SKIP: capturer=%s detector=%s" % (
@@ -1506,51 +1586,67 @@ class StatsGUI:
         std_val = np.std(gray)
         method = "pyautogui" if self.capturer.use_fallback else "mss"
 
-        # Compare with baseline to detect changes
-        change_pct = 0
-        if self.baseline_crop is not None:
-            try:
-                base_gray = cv2.cvtColor(self.baseline_crop, cv2.COLOR_BGR2GRAY)
-                if base_gray.shape == gray.shape:
-                    diff = cv2.absdiff(gray, base_gray)
-                    change_pct = float(np.mean(diff))
-            except Exception:
-                pass
-
-        # Auto-save first 50 scans for diagnostics (always, no checkbox needed)
+        # Auto-save first 50 scans for diagnostics
         if self.scan_count <= 50:
             debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
             os.makedirs(debug_dir, exist_ok=True)
             cv2.imwrite(os.path.join(debug_dir, f"auto_scan_{self.scan_count:03d}.png"), crop)
 
-        # Warn about potentially invalid capture
-        change_str = f" change={change_pct:.1f}" if self.baseline_crop is not None else ""
-        if std_val < 5:
-            self._log(f"Scan #{self.scan_count}: BLACK/UNIFORM image! "
-                      f"mean={mean_val:.0f} std={std_val:.1f}{change_str} via {method}", "ERROR")
-        elif self.scan_count <= 10 or self.scan_count % 10 == 0:
-            # Log first 10 scans and every 10th after
-            self._log(f"Scan #{self.scan_count}: {crop.shape[1]}x{crop.shape[0]} "
-                      f"mean={mean_val:.0f} std={std_val:.1f}{change_str} via {method}")
-
         # Save crop for preview (thread-safe: just save reference)
         self.latest_crop = crop.copy()
 
-        # Run detection (state machine handles logging logic)
+        # === POPUP PRESENCE CHECK (v15) ===
+        # Compare background of current crop to calibration baseline.
+        # Only proceed with food detection if popup background is present.
+        popup_present, popup_corr = self._check_popup_presence(gray)
+        self.last_popup_corr = popup_corr  # For GUI display
+
+        if not popup_present:
+            # No popup visible — this is the wheel or game UI, NOT the result popup
+            det_info = f"No popup (corr={popup_corr:.2f} < {self.popup_correlation_threshold})"
+
+            # Reset detector state when popup disappears
+            if self.detector.popup_active:
+                self.detector.popup_active = False
+                self.detector.consecutive_food = None
+                self.detector.consecutive_count = 0
+                det_info += " — popup gone, ready"
+
+            self.detector.last_scan_info = det_info
+
+            if self.scan_count <= 10 or self.scan_count % 20 == 0:
+                self._log(f"Scan #{self.scan_count}: {det_info}")
+
+            self.root.after(0, self._update_preview)
+            self.root.after(0, lambda t=det_info: self.diag_label.config(text=t))
+            self.root.after(0, lambda: self.scan_label.config(text=f"Scans: {self.scan_count}"))
+            return
+
+        # === POPUP IS PRESENT — proceed with food detection ===
+
+        # Warn about potentially invalid capture
+        if std_val < 5:
+            self._log(f"Scan #{self.scan_count}: BLACK/UNIFORM image! "
+                      f"mean={mean_val:.0f} std={std_val:.1f} via {method}", "ERROR")
+        elif self.scan_count <= 10 or self.scan_count % 10 == 0:
+            self._log(f"Scan #{self.scan_count}: POPUP(corr={popup_corr:.2f}) "
+                      f"mean={mean_val:.0f} std={std_val:.1f} via {method}")
+
+        # Run detection (state machine handles stability + logging)
         food_name, confidence = self.detector.scan_crop(crop)
 
-        # Log detection result with stability info
+        # Log detection result
         det_info = self.detector.last_scan_info
-        img_diff = self.detector.last_image_diff
+        det_info_with_popup = f"[popup={popup_corr:.2f}] {det_info}"
 
         if food_name:
-            self._log(f"CONFIRMED: {food_name} ({confidence:.0%}) — {det_info}", "DETECT")
+            self._log(f"CONFIRMED: {food_name} ({confidence:.0%}) — {det_info_with_popup}", "DETECT")
         elif self.scan_count <= 10 or self.scan_count % 20 == 0:
-            self._log(f"Scan #{self.scan_count}: {det_info}")
+            self._log(f"Scan #{self.scan_count}: {det_info_with_popup}")
 
         # Update preview and diagnostics on main thread
         self.root.after(0, self._update_preview)
-        self.root.after(0, lambda t=det_info: self.diag_label.config(text=t))
+        self.root.after(0, lambda t=det_info_with_popup: self.diag_label.config(text=t))
         self.root.after(0, lambda: self.scan_label.config(text=f"Scans: {self.scan_count}"))
 
         if food_name:
