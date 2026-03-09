@@ -243,17 +243,64 @@ class StatsGUI:
         )
         self.debug_cb.pack(side="right", padx=3)
 
-    # ===================== CALIBRATION STATUS =====================
+    # ===================== CALIBRATION + LIVE PREVIEW =====================
     def _build_calibration_info(self):
-        """Show calibration status bar."""
+        """Show calibration status + live crop preview."""
         self.cal_frame = tk.Frame(self.main_frame, bg=self.CARD_BG, pady=6, padx=10)
         self.cal_frame.pack(fill="x", padx=10, pady=(4, 0))
 
+        # Top row: calibration status
         self.cal_status_label = tk.Label(
             self.cal_frame, text="",
             font=("Segoe UI", 9), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
         )
         self.cal_status_label.pack(fill="x")
+
+        # Live preview row (hidden until monitoring starts)
+        self.preview_row = tk.Frame(self.cal_frame, bg=self.CARD_BG)
+        self.preview_row.pack(fill="x", pady=(4, 0))
+
+        # Preview thumbnail (100x100 pixels)
+        # Create a blank placeholder image
+        blank = Image.new("RGB", (100, 100), "#000000")
+        self.preview_photo = ImageTk.PhotoImage(blank)
+        self.preview_label = tk.Label(
+            self.preview_row, image=self.preview_photo, bg="#000000",
+            relief="solid", borderwidth=1
+        )
+        self.preview_label.pack(side="left", padx=(0, 8))
+        self.latest_crop = None  # Shared variable for scan thread
+
+        # Preview info
+        info_frame = tk.Frame(self.preview_row, bg=self.CARD_BG)
+        info_frame.pack(side="left", fill="x", expand=True)
+
+        self.preview_match_label = tk.Label(
+            info_frame, text="Best match: --",
+            font=("Segoe UI", 11, "bold"), fg=self.TEXT_COLOR, bg=self.CARD_BG, anchor="w"
+        )
+        self.preview_match_label.pack(fill="x")
+
+        self.preview_score_label = tk.Label(
+            info_frame, text="Score: --  |  Scale: --  |  Threshold: 35%",
+            font=("Consolas", 9), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
+        )
+        self.preview_score_label.pack(fill="x")
+
+        self.preview_state_label = tk.Label(
+            info_frame, text="State: Stopped",
+            font=("Segoe UI", 9), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
+        )
+        self.preview_state_label.pack(fill="x")
+
+        self.preview_refs_label = tk.Label(
+            info_frame, text="",
+            font=("Segoe UI", 8), fg="#484f58", bg=self.CARD_BG, anchor="w"
+        )
+        self.preview_refs_label.pack(fill="x")
+
+        # Initially hide preview row
+        self.preview_row.pack_forget()
 
     def _update_calibration_status(self):
         """Update the calibration status display."""
@@ -271,6 +318,51 @@ class StatsGUI:
                 text="Not calibrated  |  Click 'Calibrate' with a result popup visible on screen",
                 fg="#d29922"
             )
+
+    def _update_preview(self):
+        """Update the live crop preview from the latest scan."""
+        if self.latest_crop is None:
+            return
+        try:
+            rgb = cv2.cvtColor(self.latest_crop, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            pil_img = pil_img.resize((100, 100), Image.LANCZOS)
+            self.preview_photo = ImageTk.PhotoImage(pil_img)
+            self.preview_label.config(image=self.preview_photo)
+        except Exception:
+            pass
+
+        # Update match info
+        if self.detector:
+            food = self.detector.last_best_food
+            score = self.detector.last_best_score
+            scale = self.detector.last_best_scale
+            threshold = self.detector.match_threshold
+
+            if food:
+                d = FOOD_DISPLAY.get(food, {})
+                name = d.get("name", food)
+                color = self.GREEN if score >= threshold else "#d29922" if score >= threshold * 0.7 else self.RED
+                self.preview_match_label.config(
+                    text=f"Best match: {name}", fg=color)
+                self.preview_score_label.config(
+                    text=f"Score: {score:.1%}  |  Scale: {scale:.2f}x  |  Threshold: {threshold:.0%}")
+            else:
+                self.preview_match_label.config(
+                    text="Best match: --", fg=self.TEXT_DIM)
+
+            # State
+            state = self.detector.last_scan_info
+            self.preview_state_label.config(text=f"State: {state}")
+
+            # Refs count
+            ref_count = sum(len(v) for v in self.detector.references.values())
+            if ref_count > 0:
+                self.preview_refs_label.config(
+                    text=f"Learned references: {ref_count} (from manual adds)")
+            else:
+                self.preview_refs_label.config(
+                    text="Tip: Use Manual Add while popup is visible to teach the program")
 
     # ===================== SUMMARY CARDS =====================
     def _build_summary_cards(self):
@@ -956,6 +1048,7 @@ class StatsGUI:
             self.monitoring = False
             self.btn_monitor.config(text=" START MONITORING", bg="#238636")
             self.status_label.config(text="Stopped", fg=self.TEXT_DIM)
+            self.preview_row.pack_forget()
         else:
             # Check calibration
             ix = self.settings.get("icon_center_x", 0)
@@ -975,11 +1068,16 @@ class StatsGUI:
                     "No icon templates loaded!\nAdd images to the 'templates/' folder.")
                 return
 
-            # Apply debug setting to detector
+            # Apply settings to detector
             if self.detector:
-                self.detector.debug_enabled = self.settings.get("debug_saves", False)
+                debug = self.settings.get("debug_saves", False)
+                self.detector.debug_enabled = debug
+                self.detector.save_all_scans = debug  # Save all scans when debug is ON
                 self.detector.popup_active = False
                 self.detector.consecutive_no_match = 0
+
+            # Show live preview
+            self.preview_row.pack(fill="x", pady=(4, 0))
 
             self.monitoring = True
             self.btn_monitor.config(text=" STOP MONITORING", bg="#da3633")
@@ -1002,6 +1100,7 @@ class StatsGUI:
         """
         Capture the small calibrated crop and detect the food icon.
         State-machine approach: always tries to identify, logs once per popup.
+        Updates the live preview with every scan.
         """
         if not self.capturer or not self.detector:
             return
@@ -1024,10 +1123,14 @@ class StatsGUI:
 
         self.scan_count += 1
 
+        # Save crop for preview (thread-safe: just save reference)
+        self.latest_crop = crop.copy()
+
         # Run detection (state machine handles logging logic)
         food_name, confidence = self.detector.scan_crop(crop)
 
-        # Update diagnostic display
+        # Update preview and diagnostics on main thread
+        self.root.after(0, self._update_preview)
         diag_text = self.detector.last_scan_info
         self.root.after(0, lambda t=diag_text: self.diag_label.config(text=t))
 
@@ -1092,7 +1195,14 @@ class StatsGUI:
         dialog.destroy()
         self._refresh_stats()
         d = FOOD_DISPLAY[food]
-        self.status_label.config(text=f"Added: {d['name']}")
+
+        # Auto-learn: if monitoring is active and we have a crop, save as reference
+        if self.monitoring and self.latest_crop is not None and self.detector:
+            self.detector.save_reference(food, self.latest_crop)
+            self.status_label.config(
+                text=f"Added + learned: {d['name']} (saved reference crop)")
+        else:
+            self.status_label.config(text=f"Added: {d['name']}")
 
     def _test_capture(self):
         """

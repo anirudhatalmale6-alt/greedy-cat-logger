@@ -1,14 +1,10 @@
 """
-Icon detection engine for Greedy Cat Result Logger v8.
+Icon detection engine for Greedy Cat Result Logger v9.
 
-APPROACH: State-machine + focused template matching (no frame-diff gate).
-Every scan: try to identify the food icon in the crop.
-- If food detected and popup wasn't active → LOG (new popup)
-- If food detected and popup already active → skip (same popup)
-- If no food detected for 2+ scans → popup gone, ready for next
-
-v8 fixes: Removed has_changed() gate that was blocking detection.
-Added diagnostic logging for remote debugging.
+APPROACH: State-machine + multi-scale template matching + auto-save diagnostics.
+- Extended scale range (0.2x-8.0x) for small popup icons
+- Every scan is optionally saved with diagnostic info
+- Learned references from manual adds supplement static templates
 """
 
 import os
@@ -26,6 +22,11 @@ class IconDetector:
         self.templates = {}       # {food_name: BGR image}
         self.gray_templates = {}  # {food_name: grayscale image}
 
+        # Learned references from manual adds (actual popup crops)
+        self.references = {}  # {food_name: [gray_image, ...]}
+        self.references_dir = os.path.join(
+            os.path.dirname(os.path.abspath(self.templates_dir)), "learned_refs")
+
         # State machine
         self.popup_active = False
         self.last_detection_time = 0
@@ -33,22 +34,32 @@ class IconDetector:
         self.consecutive_no_match = 0
 
         # Config
-        self.match_threshold = 0.45
-        self.no_match_reset_count = 2  # Scans without match before resetting
+        self.match_threshold = 0.35  # Lowered from 0.45 for better sensitivity
+        self.no_match_reset_count = 2
+
+        # Scale range — covers popup icons (26px+) to large ones (200px+)
+        # Min 0.3x (87*0.3=26px): smaller scales cause false positives on backgrounds
+        self.match_scales = [
+            0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75,
+            1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0
+        ]
 
         # Diagnostics
         self.last_scan_info = ""
         self.last_best_food = None
         self.last_best_score = 0
+        self.last_best_scale = 0
         self.total_scans = 0
         self.total_detections = 0
 
-        # Debug capture saving
-        self.debug_enabled = False
+        # Auto-save ALL scans for diagnostics
+        self.save_all_scans = False
         self.debug_dir = "debug_captures"
-        self.debug_count = 0
+        self.debug_enabled = False
+        self.scan_save_count = 0
 
         self.load_templates()
+        self.load_references()
 
     def load_templates(self):
         """Load template images from the templates directory."""
@@ -69,14 +80,57 @@ class IconDetector:
                         self.gray_templates[food] = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                     break
 
+    def load_references(self):
+        """Load learned reference crops from manual adds."""
+        self.references = {}
+        if not os.path.exists(self.references_dir):
+            return
+
+        for food in FOOD_ITEMS:
+            food_dir = os.path.join(self.references_dir, food)
+            if os.path.isdir(food_dir):
+                refs = []
+                for fname in sorted(os.listdir(food_dir)):
+                    if fname.endswith(('.png', '.jpg')):
+                        img = cv2.imread(os.path.join(food_dir, fname))
+                        if img is not None:
+                            refs.append(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+                if refs:
+                    self.references[food] = refs
+
+    def save_reference(self, food_name, crop_image):
+        """Save a crop as a learned reference for a food item."""
+        food_dir = os.path.join(self.references_dir, food_name)
+        os.makedirs(food_dir, exist_ok=True)
+
+        existing = len([f for f in os.listdir(food_dir) if f.endswith('.png')])
+        fname = os.path.join(food_dir, f"ref_{existing + 1:03d}.png")
+        cv2.imwrite(fname, crop_image)
+
+        # Reload references
+        gray = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
+        if food_name not in self.references:
+            self.references[food_name] = []
+        self.references[food_name].append(gray)
+
+        # Keep only last 5 per food
+        if len(self.references[food_name]) > 5:
+            self.references[food_name] = self.references[food_name][-5:]
+
+        print(f"[LEARN] Saved reference for {food_name} ({existing + 1} total)")
+
     def identify_icon(self, crop_image):
         """
-        Identify which food icon is in a cropped image using multi-scale
-        template matching.
+        Identify which food icon is in a cropped image.
+        Uses multi-scale template matching against both static templates
+        and learned references.
 
         Returns: (food_name, confidence) or (None, 0)
         """
-        if crop_image is None or crop_image.size == 0 or not self.gray_templates:
+        if crop_image is None or crop_image.size == 0:
+            return None, 0
+
+        if not self.gray_templates and not self.references:
             return None, 0
 
         gray = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
@@ -84,15 +138,17 @@ class IconDetector:
 
         best_food = None
         best_score = 0
+        best_scale = 0
 
+        # Match against static templates
         for food, tmpl in self.gray_templates.items():
             th, tw = tmpl.shape[:2]
 
-            for scale in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0]:
+            for scale in self.match_scales:
                 nh = int(th * scale)
                 nw = int(tw * scale)
 
-                if nh < 12 or nw < 12 or nh > ch - 2 or nw > cw - 2:
+                if nh < 10 or nw < 10 or nh > ch - 2 or nw > cw - 2:
                     continue
 
                 try:
@@ -103,12 +159,43 @@ class IconDetector:
                     if max_val > best_score:
                         best_score = max_val
                         best_food = food
+                        best_scale = scale
                 except Exception:
                     continue
+
+        # Match against learned references (higher weight — these are real popup crops)
+        for food, ref_list in self.references.items():
+            for ref_gray in ref_list:
+                rh, rw = ref_gray.shape[:2]
+
+                # References are already at the right scale (same crop size)
+                # Just do direct matching at scale 1.0 and nearby
+                for scale in [0.7, 0.85, 1.0, 1.15, 1.3]:
+                    nh = int(rh * scale)
+                    nw = int(rw * scale)
+
+                    if nh < 10 or nw < 10 or nh > ch - 2 or nw > cw - 2:
+                        continue
+
+                    try:
+                        scaled = cv2.resize(ref_gray, (nw, nh))
+                        result = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
+                        _, max_val, _, _ = cv2.minMaxLoc(result)
+
+                        # Give learned references a 10% boost
+                        boosted = max_val * 1.1
+
+                        if boosted > best_score:
+                            best_score = boosted
+                            best_food = food
+                            best_scale = scale
+                    except Exception:
+                        continue
 
         # Store for diagnostics
         self.last_best_food = best_food
         self.last_best_score = best_score
+        self.last_best_scale = best_scale
 
         if best_score >= self.match_threshold:
             return best_food, best_score
@@ -117,13 +204,7 @@ class IconDetector:
     def scan_crop(self, crop_image):
         """
         Main detection method — state machine approach.
-
-        Every scan: try to identify the food icon.
-        - Food found + popup not active → NEW POPUP → log it
-        - Food found + popup already active → same popup → skip
-        - No food for 2+ scans → popup gone → reset state
-
-        Returns: (food_name, confidence) or (None, 0)
+        Always tries to identify. Logs once per popup appearance.
         """
         if crop_image is None or crop_image.size == 0:
             self.last_scan_info = "Empty crop"
@@ -135,38 +216,38 @@ class IconDetector:
         food, conf = self.identify_icon(crop_image)
         now = time.time()
 
+        # Build diagnostic info
+        best_info = (f"{self.last_best_food} {self.last_best_score:.0%} "
+                     f"@{self.last_best_scale:.2f}x") if self.last_best_food else "no match"
+
+        # Auto-save scan for diagnostics
+        if self.save_all_scans or self.debug_enabled:
+            self._save_scan(crop_image, food, conf)
+
         if food and conf >= self.match_threshold:
             self.consecutive_no_match = 0
 
             if not self.popup_active:
-                # NEW popup detected! Log it
+                # NEW popup detected
                 self.popup_active = True
                 self.last_detection_time = now
                 self.last_detected_food = food
                 self.total_detections += 1
 
-                self.last_scan_info = f"NEW: {food} ({conf:.0%})"
-                print(f"[DETECT] Round detected: {food} (confidence: {conf:.1%})")
-
-                if self.debug_enabled:
-                    self._save_debug(crop_image, food, conf)
-
+                self.last_scan_info = f"DETECTED: {food} ({conf:.0%}) @{self.last_best_scale:.1f}x"
+                print(f"[DETECT] Round: {food} (conf: {conf:.1%}, scale: {self.last_best_scale:.2f}x)")
                 return food, conf
             else:
-                # Popup already active — same popup, don't log again
                 self.last_scan_info = f"Active: {food} ({conf:.0%}) [skip]"
                 return None, 0
         else:
-            # No food detected above threshold
             self.consecutive_no_match += 1
-            best_info = f"best: {self.last_best_food} {self.last_best_score:.0%}" if self.last_best_food else "no match"
 
             if self.consecutive_no_match >= self.no_match_reset_count:
                 if self.popup_active:
-                    # Popup has disappeared — reset state
                     self.popup_active = False
                     self.last_scan_info = f"Popup gone ({best_info}), ready"
-                    print(f"[STATE] Popup gone, ready for next detection")
+                    print(f"[STATE] Popup gone, ready for next")
                 else:
                     self.last_scan_info = f"Waiting ({best_info})"
             else:
@@ -174,34 +255,36 @@ class IconDetector:
 
             return None, 0
 
-    # ---- Compatibility wrappers ----
+    def _save_scan(self, image, food, conf):
+        """Save scan crop with diagnostic info in filename."""
+        os.makedirs(self.debug_dir, exist_ok=True)
+        self.scan_save_count += 1
 
+        best = f"{self.last_best_food}_{self.last_best_score:.0%}" if self.last_best_food else "none_0%"
+        state = "DET" if food else "wait"
+        fname = os.path.join(
+            self.debug_dir,
+            f"scan_{self.scan_save_count:05d}_{state}_{best}.png")
+        cv2.imwrite(fname, image)
+
+        # Keep only last 100
+        try:
+            files = sorted(
+                [os.path.join(self.debug_dir, f) for f in os.listdir(self.debug_dir)
+                 if f.startswith('scan_') and f.endswith('.png')],
+                key=os.path.getmtime)
+            while len(files) > 100:
+                os.remove(files.pop(0))
+        except Exception:
+            pass
+
+    # Compatibility
     def find_best_match_in_region(self, image):
         food, conf = self.identify_icon(image)
         return food, conf, 0, 0
 
     def scan_full_window(self, current_frame):
         return self.scan_crop(current_frame)
-
-    # ---- Debug ----
-
-    def _save_debug(self, image, food, conf):
-        """Save debug capture for troubleshooting."""
-        os.makedirs(self.debug_dir, exist_ok=True)
-        self.debug_count += 1
-        fname = os.path.join(self.debug_dir,
-                             f"detect_{self.debug_count:04d}_{food}_{conf:.0%}.png")
-        cv2.imwrite(fname, image)
-        # Keep only last 50
-        files = sorted(
-            [os.path.join(self.debug_dir, f) for f in os.listdir(self.debug_dir)
-             if f.endswith('.png')],
-            key=os.path.getmtime
-        )
-        while len(files) > 50:
-            os.remove(files.pop(0))
-
-    # ---- Properties ----
 
     @property
     def is_ready(self):
