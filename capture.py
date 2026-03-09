@@ -1,15 +1,15 @@
-"""Screen capture module for Greedy Cat Result Logger v9
+"""Screen capture module for Greedy Cat Result Logger v11
 
 Supports two capture methods:
-1. mss (default) — fast, but may fail on DirectX/OpenGL windows (black screen)
-2. pyautogui/PIL (fallback) — slower but more compatible with emulators
+1. mss (default) — fast, but NOT thread-safe (fails from daemon threads)
+2. pyautogui/PIL (fallback) — slower but works from any thread and with emulators
 
-When BlueStacks or other emulators use hardware acceleration, mss often
-captures a black rectangle instead of the actual game content. The fallback
-method uses PIL's ImageGrab which handles this better on Windows.
+CRITICAL FIX (v11): mss.mss() object is NOT thread-safe. The object created
+on the main thread fails when used from the monitoring daemon thread.
+Solution: Create a fresh mss instance per capture call.
+Also: Auto-switch to pyautogui after 3 consecutive mss failures.
 """
 
-import time
 import sys
 import mss
 import numpy as np
@@ -29,11 +29,12 @@ class ScreenCapture:
     ]
 
     def __init__(self):
-        self.sct = mss.mss()
         self.result_region = None
         self.last_capture = None
         self.last_capture_time = 0
         self.use_fallback = False  # True = use pyautogui instead of mss
+        self.mss_fail_count = 0    # Track consecutive mss failures
+        self.mss_auto_switched = False  # True if we auto-switched to pyautogui
 
     def set_result_region(self, x, y, width, height):
         """Set the region where the Result row appears."""
@@ -43,22 +44,38 @@ class ScreenCapture:
         """Capture a specific region of the screen using the best available method."""
         if self.use_fallback:
             return self._capture_region_pyautogui(x, y, width, height)
-        return self._capture_region_mss(x, y, width, height)
+
+        # Try mss first
+        img = self._capture_region_mss(x, y, width, height)
+        if img is not None:
+            self.mss_fail_count = 0
+            return img
+
+        # mss failed — track and auto-switch after 3 failures
+        self.mss_fail_count += 1
+        if self.mss_fail_count >= 3 and not self.mss_auto_switched:
+            print(f"[capture] mss failed {self.mss_fail_count} times, auto-switching to pyautogui")
+            self.use_fallback = True
+            self.mss_auto_switched = True
+
+        # Try pyautogui as immediate fallback for this call
+        return self._capture_region_pyautogui(x, y, width, height)
 
     def _capture_region_mss(self, x, y, width, height):
-        """Capture using mss (fast but may fail on DirectX windows)."""
+        """Capture using mss. Creates a fresh instance each call (thread-safe)."""
         try:
-            region = {"left": x, "top": y, "width": width, "height": height}
-            screenshot = self.sct.grab(region)
-            img = np.array(screenshot)
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            return img
+            with mss.mss() as sct:
+                region = {"left": x, "top": y, "width": width, "height": height}
+                screenshot = sct.grab(region)
+                img = np.array(screenshot)
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                return img
         except Exception as e:
             print(f"[mss] Capture error: {e}")
             return None
 
     def _capture_region_pyautogui(self, x, y, width, height):
-        """Capture using pyautogui/PIL (more compatible with emulators)."""
+        """Capture using PIL ImageGrab (Windows) or pyautogui (other platforms)."""
         try:
             if sys.platform == "win32":
                 from PIL import ImageGrab
@@ -84,12 +101,14 @@ class ScreenCapture:
         return self._capture_full_screen_mss()
 
     def _capture_full_screen_mss(self):
+        """Full screen capture with fresh mss instance (thread-safe)."""
         try:
-            monitor = self.sct.monitors[1]
-            screenshot = self.sct.grab(monitor)
-            img = np.array(screenshot)
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            return img
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                screenshot = sct.grab(monitor)
+                img = np.array(screenshot)
+                img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                return img
         except Exception as e:
             print(f"[mss] Full screen capture error: {e}")
             return None
@@ -126,7 +145,7 @@ class ScreenCapture:
         """
         results = {}
 
-        # Test mss
+        # Test mss (fresh instance)
         mss_img = self._capture_region_mss(x, y, width, height)
         mss_valid = self._validate_capture(mss_img)
         results["mss"] = (mss_img, mss_valid)
@@ -153,12 +172,9 @@ class ScreenCapture:
         std_dev = np.std(gray)
         mean_val = np.mean(gray)
 
-        # Black screen: mean ~0, std ~0
-        # Uniform color: std < 5
-        # Real content: std > 10, mean varies
         if std_dev < 5:
             return False
-        if mean_val < 3:  # Nearly all black
+        if mean_val < 3:
             return False
         return True
 
@@ -220,4 +236,5 @@ class ScreenCapture:
 
     def get_monitors(self):
         """Get list of available monitors."""
-        return self.sct.monitors
+        with mss.mss() as sct:
+            return sct.monitors

@@ -1454,6 +1454,8 @@ class StatsGUI:
         if crop is None:
             method = "pyautogui" if self.capturer.use_fallback else "mss"
             self._log(f"Capture FAILED (None) at ({cap_x},{cap_y}) {crop_size}x{crop_size} via {method}", "ERROR")
+            if self.capturer.mss_auto_switched:
+                self._log("Auto-switched to pyautogui (mss not working from thread)", "WARN")
             self.root.after(0, lambda: self.diag_label.config(text="Capture failed!"))
             return
 
