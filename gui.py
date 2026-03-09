@@ -1,7 +1,9 @@
 """
-Statistics GUI for Greedy Cat Result Logger v2
+Statistics GUI for Greedy Cat Result Logger v7
 Shows history as game icons, hot/cold items, percentages, streaks.
 Dark theme matching reference software style.
+
+New in v7: One-click calibration for reliable popup detection.
 """
 
 import tkinter as tk
@@ -10,6 +12,7 @@ import os
 import threading
 import time
 import json
+import cv2
 from datetime import datetime
 from PIL import Image, ImageTk
 from config import FOOD_ITEMS, FOOD_DISPLAY, FOOD_MULTIPLIER, TEMPLATES_DIR
@@ -41,7 +44,6 @@ class StatsGUI:
         self.capturer = capturer
         self.monitoring = False
         self.monitor_thread = None
-        self.previous_strip_hash = ""
         self.scan_count = 0
         self.predictor = Predictor()
 
@@ -64,10 +66,15 @@ class StatsGUI:
 
         self._build_gui()
         self._refresh_stats()
+        self._update_calibration_status()
 
     def _load_settings(self):
         """Load saved settings."""
-        defaults = {"region_x": 0, "region_y": 0, "region_w": 0, "region_h": 0, "interval": 1.5}
+        defaults = {
+            "region_x": 0, "region_y": 0, "region_w": 0, "region_h": 0,
+            "icon_center_x": 0, "icon_center_y": 0, "crop_size": 150,
+            "interval": 1.5,
+        }
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, 'r') as f:
@@ -155,6 +162,7 @@ class StatsGUI:
         # ===== BUILD SECTIONS =====
         self._build_header()
         self._build_controls()
+        self._build_calibration_info()
         self._build_summary_cards()
         self._build_prediction()
         self._build_recent_results()
@@ -173,7 +181,7 @@ class StatsGUI:
 
         tk.Label(title_frame, text="GREEDY CAT RESULT LOGGER",
                  font=("Segoe UI", 18, "bold"), fg=self.GOLD, bg="#1a1a2e").pack()
-        tk.Label(title_frame, text="Real-time auto-detection & statistics",
+        tk.Label(title_frame, text="One-click calibrate, then auto-detect every round",
                  font=("Segoe UI", 9), fg=self.TEXT_DIM, bg="#1a1a2e").pack()
 
     # ===================== CONTROLS =====================
@@ -190,10 +198,10 @@ class StatsGUI:
         self.btn_monitor.pack(side="left", padx=3)
 
         tk.Button(
-            ctrl, text="Set Region", font=("Segoe UI", 9),
-            bg="#30363d", fg=self.TEXT_COLOR, relief="flat", padx=10, pady=5,
-            command=self._set_region, cursor="hand2",
-            activebackground="#484f58"
+            ctrl, text="Calibrate", font=("Segoe UI", 9, "bold"),
+            bg="#d29922", fg="white", relief="flat", padx=12, pady=5,
+            command=self._calibrate, cursor="hand2",
+            activebackground="#e3b341"
         ).pack(side="left", padx=3)
 
         tk.Button(
@@ -223,6 +231,35 @@ class StatsGUI:
             command=self._export_excel, cursor="hand2",
             activebackground="#bb8009"
         ).pack(side="right", padx=3)
+
+    # ===================== CALIBRATION STATUS =====================
+    def _build_calibration_info(self):
+        """Show calibration status bar."""
+        self.cal_frame = tk.Frame(self.main_frame, bg=self.CARD_BG, pady=6, padx=10)
+        self.cal_frame.pack(fill="x", padx=10, pady=(4, 0))
+
+        self.cal_status_label = tk.Label(
+            self.cal_frame, text="",
+            font=("Segoe UI", 9), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
+        )
+        self.cal_status_label.pack(fill="x")
+
+    def _update_calibration_status(self):
+        """Update the calibration status display."""
+        ix = self.settings.get("icon_center_x", 0)
+        iy = self.settings.get("icon_center_y", 0)
+        cs = self.settings.get("crop_size", 150)
+
+        if ix > 0 and iy > 0:
+            self.cal_status_label.config(
+                text=f"Calibrated: Icon at ({ix}, {iy}), crop {cs}x{cs}px  |  Ready to monitor",
+                fg=self.GREEN
+            )
+        else:
+            self.cal_status_label.config(
+                text="Not calibrated  |  Click 'Calibrate' with a result popup visible on screen",
+                fg="#d29922"
+            )
 
     # ===================== SUMMARY CARDS =====================
     def _build_summary_cards(self):
@@ -688,7 +725,212 @@ class StatsGUI:
         self.scan_label.config(text=f"Scans: {self.scan_count}")
 
     # ================================================================
-    #                      CONTROL ACTIONS
+    #                      CALIBRATION
+    # ================================================================
+
+    def _calibrate(self):
+        """
+        One-click calibration: user clicks on the food icon center in the popup.
+        The program saves those screen coordinates and uses a small crop
+        around that point for all future detections.
+        """
+        if not self.capturer:
+            messagebox.showwarning("No Capturer", "Screen capture module not available.")
+            return
+
+        # Stop monitoring if running
+        was_monitoring = self.monitoring
+        if was_monitoring:
+            self.monitoring = False
+            self.btn_monitor.config(text=" START MONITORING", bg="#238636")
+
+        # Capture the full screen
+        full_screen = self.capturer.capture_full_screen()
+        if full_screen is None:
+            messagebox.showerror("Error", "Could not capture screen.\nMake sure the game is visible.")
+            return
+
+        sh, sw = full_screen.shape[:2]
+
+        # Create calibration window
+        cal_win = tk.Toplevel(self.root)
+        cal_win.title("Calibrate - Click on the Food Icon Center")
+        cal_win.configure(bg="#0d1117")
+        cal_win.attributes('-topmost', True)
+
+        # Scale screenshot to fit in window
+        max_w, max_h = min(sw, 1280), min(sh, 750)
+        scale = min(max_w / sw, max_h / sh)
+        display_w = int(sw * scale)
+        display_h = int(sh * scale)
+
+        # Instructions
+        instr_frame = tk.Frame(cal_win, bg="#1a1a2e", padx=10, pady=8)
+        instr_frame.pack(fill="x")
+
+        tk.Label(instr_frame,
+                 text="STEP 1: Make sure a result popup is visible in the game",
+                 font=("Segoe UI", 11, "bold"), fg="#FFD700", bg="#1a1a2e",
+                 anchor="w").pack(fill="x")
+        tk.Label(instr_frame,
+                 text="STEP 2: Click on the CENTER of the food icon in the popup below",
+                 font=("Segoe UI", 11, "bold"), fg="#3fb950", bg="#1a1a2e",
+                 anchor="w").pack(fill="x")
+        tk.Label(instr_frame,
+                 text="(The green rectangle shows the capture area that will be monitored)",
+                 font=("Segoe UI", 9), fg="#8b949e", bg="#1a1a2e",
+                 anchor="w").pack(fill="x")
+
+        # Convert to PIL and display
+        rgb = cv2.cvtColor(full_screen, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        pil_img = pil_img.resize((display_w, display_h), Image.LANCZOS)
+        tk_img = ImageTk.PhotoImage(pil_img)
+
+        # Canvas with the screenshot
+        canvas = tk.Canvas(cal_win, width=display_w, height=display_h,
+                           cursor="crosshair", bg="#000000")
+        canvas.pack(padx=5, pady=5)
+        canvas.create_image(0, 0, anchor="nw", image=tk_img)
+        canvas._img_ref = tk_img  # Prevent garbage collection
+
+        # Track drawn items for cleanup
+        drawn_items = []
+        crop_size = self.settings.get("crop_size", 150)
+
+        def on_click(event):
+            # Convert display coordinates back to full screen coordinates
+            screen_x = int(event.x / scale)
+            screen_y = int(event.y / scale)
+
+            # Clear previous drawn items
+            for item in drawn_items:
+                canvas.delete(item)
+            drawn_items.clear()
+
+            # Draw crop rectangle (green)
+            half_disp = int(crop_size / 2 * scale)
+            x1 = event.x - half_disp
+            y1 = event.y - half_disp
+            x2 = event.x + half_disp
+            y2 = event.y + half_disp
+            drawn_items.append(
+                canvas.create_rectangle(x1, y1, x2, y2,
+                                        outline="#00ff00", width=2, dash=(4, 2))
+            )
+
+            # Draw crosshair (red)
+            drawn_items.append(
+                canvas.create_line(event.x - 15, event.y, event.x + 15, event.y,
+                                   fill="#ff0000", width=2)
+            )
+            drawn_items.append(
+                canvas.create_line(event.x, event.y - 15, event.x, event.y + 15,
+                                   fill="#ff0000", width=2)
+            )
+
+            # Draw coordinate label
+            drawn_items.append(
+                canvas.create_text(event.x + 20, event.y - 20,
+                                   text=f"({screen_x}, {screen_y})",
+                                   fill="#00ff00", font=("Consolas", 10, "bold"),
+                                   anchor="nw")
+            )
+
+            # Try to identify what's at this position (verification)
+            half = crop_size // 2
+            cx = max(half, min(screen_x, sw - half))
+            cy = max(half, min(screen_y, sh - half))
+            test_crop = full_screen[cy - half:cy + half, cx - half:cx + half]
+
+            verify_text = ""
+            if self.detector and self.detector.is_ready and test_crop.size > 0:
+                food, conf = self.detector.identify_icon(test_crop)
+                if food:
+                    d = FOOD_DISPLAY.get(food, {})
+                    verify_text = f"Detected: {d.get('name', food)} ({conf:.0%})"
+                    drawn_items.append(
+                        canvas.create_text(event.x + 20, event.y + 5,
+                                           text=verify_text,
+                                           fill="#3fb950", font=("Segoe UI", 10, "bold"),
+                                           anchor="nw")
+                    )
+                else:
+                    drawn_items.append(
+                        canvas.create_text(event.x + 20, event.y + 5,
+                                           text="No match at this position",
+                                           fill="#f85149", font=("Segoe UI", 9),
+                                           anchor="nw")
+                    )
+
+            # Save coordinates
+            self.settings["icon_center_x"] = screen_x
+            self.settings["icon_center_y"] = screen_y
+            self.settings["crop_size"] = crop_size
+            self._save_settings()
+
+        def on_confirm():
+            ix = self.settings.get("icon_center_x", 0)
+            iy = self.settings.get("icon_center_y", 0)
+            if ix == 0 and iy == 0:
+                messagebox.showwarning("Not Set",
+                    "Please click on the food icon in the screenshot first.")
+                return
+
+            self._update_calibration_status()
+            self.status_label.config(
+                text=f"Calibrated: icon at ({ix}, {iy}), crop {crop_size}x{crop_size}px",
+                fg=self.GREEN)
+            cal_win.destroy()
+
+            messagebox.showinfo("Calibration Complete",
+                f"Icon position saved: ({ix}, {iy})\n"
+                f"Crop region: {crop_size}x{crop_size} pixels\n\n"
+                "Click START MONITORING to begin auto-detection.\n"
+                "Keep the game window in the same position!")
+
+        canvas.bind("<Button-1>", on_click)
+
+        # Confirm button
+        btn_frame = tk.Frame(cal_win, bg="#0d1117", pady=6)
+        btn_frame.pack(fill="x")
+
+        tk.Button(btn_frame, text="Confirm Calibration",
+                  font=("Segoe UI", 11, "bold"),
+                  bg="#238636", fg="white", relief="flat", padx=20, pady=6,
+                  command=on_confirm, cursor="hand2").pack(side="left", padx=10)
+
+        tk.Button(btn_frame, text="Cancel",
+                  font=("Segoe UI", 10),
+                  bg="#da3633", fg="white", relief="flat", padx=14, pady=6,
+                  command=cal_win.destroy, cursor="hand2").pack(side="left", padx=5)
+
+        # Crop size adjustment
+        size_frame = tk.Frame(btn_frame, bg="#0d1117")
+        size_frame.pack(side="right", padx=10)
+        tk.Label(size_frame, text="Crop size:", font=("Segoe UI", 9),
+                 fg=self.TEXT_DIM, bg="#0d1117").pack(side="left")
+
+        size_var = tk.StringVar(value=str(crop_size))
+        size_entry = tk.Entry(size_frame, textvariable=size_var,
+                              font=("Segoe UI", 9), width=5)
+        size_entry.pack(side="left", padx=3)
+        tk.Label(size_frame, text="px", font=("Segoe UI", 9),
+                 fg=self.TEXT_DIM, bg="#0d1117").pack(side="left")
+
+        def update_crop_size(*args):
+            nonlocal crop_size
+            try:
+                val = int(size_var.get())
+                if 50 <= val <= 500:
+                    crop_size = val
+            except ValueError:
+                pass
+
+        size_var.trace_add("write", update_crop_size)
+
+    # ================================================================
+    #                      MONITORING
     # ================================================================
 
     def _toggle_monitoring(self):
@@ -697,25 +939,28 @@ class StatsGUI:
             self.btn_monitor.config(text=" START MONITORING", bg="#238636")
             self.status_label.config(text="Stopped", fg=self.TEXT_DIM)
         else:
+            # Check calibration
+            ix = self.settings.get("icon_center_x", 0)
+            iy = self.settings.get("icon_center_y", 0)
+
+            if ix == 0 or iy == 0:
+                messagebox.showwarning("Not Calibrated",
+                    "Please calibrate first!\n\n"
+                    "1. Play a round so the result popup is visible\n"
+                    "2. Click the 'Calibrate' button\n"
+                    "3. Click on the food icon in the popup\n"
+                    "4. Then start monitoring")
+                return
+
             if self.detector and not self.detector.is_ready:
                 messagebox.showwarning("No Templates",
                     "No icon templates loaded!\nAdd images to the 'templates/' folder.")
                 return
-            if self.capturer and self.capturer.result_region is None:
-                s = self.settings
-                if s["region_w"] > 0 and s["region_h"] > 0:
-                    self.capturer.set_result_region(
-                        s["region_x"], s["region_y"], s["region_w"], s["region_h"])
-                else:
-                    messagebox.showwarning("No Region Set",
-                        "Please set the popup capture region first.\n"
-                        "Click 'Set Region' → 'Find Emulator' to auto-detect,\n"
-                        "or enter the popup area coordinates manually.")
-                    return
 
             self.monitoring = True
             self.btn_monitor.config(text=" STOP MONITORING", bg="#da3633")
-            self.status_label.config(text="MONITORING ACTIVE", fg=self.GREEN)
+            self.status_label.config(
+                text="MONITORING - Watching for results...", fg=self.GREEN)
             self._start_monitor_thread()
 
     def _start_monitor_thread(self):
@@ -725,158 +970,51 @@ class StatsGUI:
                     self._scan_once()
                 except Exception as e:
                     print(f"Scan error: {e}")
-                time.sleep(self.settings.get("interval", 2.0))
+                time.sleep(self.settings.get("interval", 1.5))
         self.monitor_thread = threading.Thread(target=loop, daemon=True)
         self.monitor_thread.start()
 
     def _scan_once(self):
         """
-        Scan the popup area for a result icon.
-        The game shows a popup with the winning food icon after each round.
-        We detect when a new popup appears, identify the icon, log it,
-        then wait for the popup to disappear before scanning again.
+        Capture the small calibrated crop and detect the food icon.
+        Uses frame differencing to detect popup changes, then template
+        matching to identify the food.
         """
         if not self.capturer or not self.detector:
             return
 
-        img = self.capturer.capture_result_strip()
-        if img is None:
+        ix = self.settings.get("icon_center_x", 0)
+        iy = self.settings.get("icon_center_y", 0)
+        crop_size = self.settings.get("crop_size", 150)
+
+        if ix == 0 or iy == 0:
+            return
+
+        # Capture a small region centered on the calibrated icon position
+        half = crop_size // 2
+        crop = self.capturer.capture_region(
+            ix - half, iy - half, crop_size, crop_size)
+
+        if crop is None:
             return
 
         self.scan_count += 1
 
-        # Compute perceptual hash of current frame for change detection
-        current_hash = self.detector.compute_image_hash(img)
+        # Use the focused scan method
+        food_name, confidence = self.detector.scan_crop(crop)
 
-        # Check if the screen changed from last scan
-        if self.previous_strip_hash:
-            dist = self.detector.hash_distance(current_hash, self.previous_strip_hash)
-            if dist < 8:
-                # Screen hasn't changed — skip (same frame)
-                return
+        if food_name:
+            self.logger.add_result(food_name, confidence=confidence)
+            self.root.after(0, self._refresh_stats)
+            d = FOOD_DISPLAY.get(food_name, {})
+            self.root.after(0, lambda fn=food_name, c=confidence: self.status_label.config(
+                text=f"Round {self.logger.total_rounds}: "
+                     f"{FOOD_DISPLAY.get(fn, {}).get('name', fn)} ({c:.0%})",
+                fg=self.GREEN))
 
-        # Try to find a food icon in the popup area using multi-scale matching
-        food_name, confidence, x, y = self.detector.find_best_match_in_region(img)
-
-        if food_name and confidence >= 0.25:
-            # Check we're not logging the same result as last time
-            last = self.logger.results[-1]["result"] if self.logger.results else None
-            last_time = self.logger.results[-1]["time"] if self.logger.results else ""
-
-            # Avoid duplicate: same food within last 5 seconds
-            import datetime as dt
-            is_duplicate = False
-            if last == food_name and last_time:
-                try:
-                    last_dt = dt.datetime.strptime(last_time, "%Y-%m-%d %H:%M:%S")
-                    now = dt.datetime.now()
-                    if (now - last_dt).total_seconds() < 5:
-                        is_duplicate = True
-                except Exception:
-                    pass
-
-            if not is_duplicate:
-                self.logger.add_result(food_name, confidence=confidence)
-                self.root.after(0, self._refresh_stats)
-                # Update status on main thread
-                d = FOOD_DISPLAY.get(food_name, {})
-                self.root.after(0, lambda: self.status_label.config(
-                    text=f"Detected: {d.get('name', food_name)} ({confidence:.0%})"))
-
-        # Always update hash so we can detect the next change
-        self.previous_strip_hash = current_hash
-
-    def _set_region(self):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Set Capture Region")
-        dialog.geometry("380x320")
-        dialog.configure(bg=self.BG_COLOR)
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        tk.Label(dialog, text="Capture Region (Popup Area)",
-                 font=("Segoe UI", 12, "bold"), fg=self.TEXT_COLOR,
-                 bg=self.BG_COLOR).pack(pady=10)
-
-        tk.Label(dialog,
-                 text="Set the region where the result popup\nappears in the Greedy Cat game.\n\n"
-                      "This should cover the popup area where\nthe winning food icon is shown after each round.",
-                 font=("Segoe UI", 9), fg=self.TEXT_DIM,
-                 bg=self.BG_COLOR, justify="center").pack(pady=5)
-
-        fields = tk.Frame(dialog, bg=self.BG_COLOR)
-        fields.pack(pady=10)
-
-        entries = {}
-        s = self.settings
-        for i, (label, key, default) in enumerate([
-            ("X:", "region_x", s["region_x"]),
-            ("Y:", "region_y", s["region_y"]),
-            ("Width:", "region_w", s["region_w"]),
-            ("Height:", "region_h", s["region_h"]),
-        ]):
-            tk.Label(fields, text=label, font=("Segoe UI", 10),
-                     fg=self.TEXT_COLOR, bg=self.BG_COLOR, width=8).grid(row=i, column=0, padx=5, pady=3)
-            entry = tk.Entry(fields, font=("Segoe UI", 10), width=10)
-            entry.insert(0, str(default))
-            entry.grid(row=i, column=1, padx=5, pady=3)
-            entries[key] = entry
-
-        def apply():
-            try:
-                vals = {k: int(e.get()) for k, e in entries.items()}
-                self.settings.update(vals)
-                self._save_settings()
-                if self.capturer:
-                    self.capturer.set_result_region(
-                        vals["region_x"], vals["region_y"],
-                        vals["region_w"], vals["region_h"])
-                self.status_label.config(
-                    text=f"Region: ({vals['region_x']},{vals['region_y']}) "
-                         f"{vals['region_w']}x{vals['region_h']}")
-                dialog.destroy()
-            except ValueError:
-                messagebox.showerror("Error", "Please enter valid numbers.")
-
-        btn_frame = tk.Frame(dialog, bg=self.BG_COLOR)
-        btn_frame.pack(pady=10)
-
-        def find_emulator():
-            if self.capturer:
-                win = self.capturer.find_emulator_window()
-                if win:
-                    # Auto-fill with the center area of the emulator where
-                    # the popup result icon appears (roughly center 40% of window)
-                    popup_x = win["left"] + int(win["width"] * 0.20)
-                    popup_y = win["top"] + int(win["height"] * 0.25)
-                    popup_w = int(win["width"] * 0.55)
-                    popup_h = int(win["height"] * 0.50)
-                    entries["region_x"].delete(0, "end")
-                    entries["region_x"].insert(0, str(popup_x))
-                    entries["region_y"].delete(0, "end")
-                    entries["region_y"].insert(0, str(popup_y))
-                    entries["region_w"].delete(0, "end")
-                    entries["region_w"].insert(0, str(popup_w))
-                    entries["region_h"].delete(0, "end")
-                    entries["region_h"].insert(0, str(popup_h))
-                    messagebox.showinfo("Found",
-                        f"Found: {win['title']}\n"
-                        f"Position: ({win['left']}, {win['top']})\n"
-                        f"Size: {win['width']}x{win['height']}\n\n"
-                        "Auto-filled popup detection region.\n"
-                        "Adjust if needed, then click Apply.")
-                else:
-                    messagebox.showwarning("Not Found",
-                        "No emulator window found.\n"
-                        "Make sure BlueStacks/LDPlayer is open.")
-
-        tk.Button(btn_frame, text="Find Emulator", font=("Segoe UI", 9),
-                  bg="#1f6feb", fg="white", relief="flat", padx=12, pady=5,
-                  command=find_emulator).pack(side="left", padx=5)
-
-        tk.Button(btn_frame, text="Apply", font=("Segoe UI", 10, "bold"),
-                  bg="#238636", fg="white", relief="flat", padx=20, pady=5,
-                  command=apply).pack(side="left", padx=5)
+    # ================================================================
+    #                      OTHER ACTIONS
+    # ================================================================
 
     def _manual_add(self):
         dialog = tk.Toplevel(self.root)
@@ -920,55 +1058,56 @@ class StatsGUI:
 
     def _test_capture(self):
         """
-        Capture the current region and try to detect a food icon.
+        Capture the calibrated crop region and try to detect the food icon.
         Shows the result and saves the capture for debugging.
         """
         if not self.capturer:
             messagebox.showwarning("No Capturer", "Screen capture not available.")
             return
 
-        if self.capturer.result_region is None:
-            s = self.settings
-            if s["region_w"] > 0 and s["region_h"] > 0:
-                self.capturer.set_result_region(
-                    s["region_x"], s["region_y"], s["region_w"], s["region_h"])
-            else:
-                messagebox.showwarning("No Region",
-                    "Please set the capture region first.\n"
-                    "Click 'Set Region' to configure.")
-                return
+        ix = self.settings.get("icon_center_x", 0)
+        iy = self.settings.get("icon_center_y", 0)
+        crop_size = self.settings.get("crop_size", 150)
 
-        img = self.capturer.capture_result_strip()
+        if ix == 0 or iy == 0:
+            messagebox.showwarning("Not Calibrated",
+                "Please calibrate first by clicking the 'Calibrate' button.")
+            return
+
+        # Capture the crop
+        half = crop_size // 2
+        img = self.capturer.capture_region(
+            ix - half, iy - half, crop_size, crop_size)
+
         if img is None:
-            messagebox.showerror("Capture Failed", "Could not capture screen region.")
+            messagebox.showerror("Capture Failed", "Could not capture the calibrated region.")
             return
 
         # Save the capture
         debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
         os.makedirs(debug_dir, exist_ok=True)
-        import cv2
         capture_path = os.path.join(debug_dir, "test_capture.png")
         cv2.imwrite(capture_path, img)
 
         # Try to detect
-        result_msg = f"Captured region: {img.shape[1]}x{img.shape[0]} pixels\n"
+        result_msg = f"Captured crop: {img.shape[1]}x{img.shape[0]} pixels\n"
+        result_msg += f"Position: centered at ({ix}, {iy})\n"
         result_msg += f"Saved to: {capture_path}\n\n"
 
         if self.detector and self.detector.is_ready:
-            food, confidence, x, y = self.detector.find_best_match_in_region(img)
+            food, confidence = self.detector.identify_icon(img)
             if food:
                 d = FOOD_DISPLAY.get(food, {})
                 result_msg += f"DETECTED: {d.get('name', food)} {d.get('emoji', '')}\n"
                 result_msg += f"Confidence: {confidence:.1%}\n"
-                result_msg += f"Position: ({x}, {y})"
                 self.status_label.config(
                     text=f"Test: {d.get('name', food)} ({confidence:.0%})")
             else:
                 result_msg += "NO MATCH FOUND\n\n"
                 result_msg += "Tips:\n"
-                result_msg += "- Make sure the popup result is visible on screen\n"
-                result_msg += "- Adjust the capture region to cover the popup area\n"
-                result_msg += "- The region should show the food icon"
+                result_msg += "- Make sure the result popup is visible on screen\n"
+                result_msg += "- Re-calibrate if the game window moved\n"
+                result_msg += "- Try adjusting the crop size (default 150px)"
                 self.status_label.config(text="Test: No match found")
         else:
             result_msg += "Detector not ready (no templates loaded)"
@@ -982,10 +1121,8 @@ class StatsGUI:
             self.logger.results.clear()
             self.logger._save_json()
             # Also clear CSV
-            import os
             if os.path.exists(self.logger.csv_path):
                 os.remove(self.logger.csv_path)
-            self.previous_strip_hash = ""
             self._refresh_stats()
             self.status_label.config(text="All results cleared")
 
