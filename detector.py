@@ -1,14 +1,21 @@
 """
-Icon detection engine for Greedy Cat Result Logger v13.
+Icon detection engine for Greedy Cat Result Logger v14.
 
-APPROACH: State-machine + multi-scale template matching + auto-save diagnostics.
+APPROACH: Stability-based detection to prevent false triggers during wheel spin.
 
-v13 FIX:
-- REMOVED confidence gap requirement — template matching on wheel icons
-  inherently produces close scores (e.g. 52% vs 51%). The gap check was
-  rejecting ALL detections. Now trusts the best match above threshold.
-- Lowered threshold back to 0.38 for better sensitivity
-- Kept: time-based state reset, different-food detection, fast reset
+v14 — CRITICAL FIX: Spinning wheel false detection
+The wheel shows food icons rotating rapidly. The detector was matching these
+spinning icons and logging them as results. The fix uses TWO stability checks:
+
+1. CONSECUTIVE MATCH: The same food must be detected in 3+ consecutive scans
+   before it's logged. During spinning, different foods appear each scan.
+   During the popup, the same food stays stable for many seconds.
+
+2. IMAGE STABILITY: The captured crop must be visually stable (low pixel
+   difference between consecutive frames). During spinning, pixels change
+   dramatically. During the popup, the image barely changes.
+
+Both conditions must be met before a result is logged.
 """
 
 import os
@@ -19,7 +26,7 @@ from config import FOOD_ITEMS, TEMPLATES_DIR
 
 
 class IconDetector:
-    """Detects food icons using focused template matching on a calibrated crop."""
+    """Detects food icons using stability-verified template matching."""
 
     def __init__(self, templates_dir=None):
         self.templates_dir = templates_dir or TEMPLATES_DIR
@@ -38,11 +45,22 @@ class IconDetector:
         self.consecutive_no_match = 0
 
         # Config
-        self.match_threshold = 0.38  # Balanced threshold for detection
-        self.no_match_reset_count = 1  # Fast reset for quick state transitions
-        self.popup_timeout = 8.0  # Seconds before popup_active auto-resets
+        self.match_threshold = 0.38  # Template matching threshold
+        self.no_match_reset_count = 1  # Scans with no match to reset popup state
+        self.popup_timeout = 10.0  # Seconds before popup_active auto-resets
 
-        # Scale range — covers popup icons (26px+) to large ones (200px+)
+        # STABILITY CONFIG (v14) — prevents detecting spinning wheel
+        self.required_consecutive = 3  # Same food must match N times in a row
+        self.image_stability_threshold = 8.0  # Max mean pixel diff for "stable"
+        self.required_stable_frames = 2  # Image must be stable for N frames
+
+        # Stability tracking
+        self.consecutive_food = None  # Current food being tracked
+        self.consecutive_count = 0  # How many times in a row
+        self.prev_gray_crop = None  # Previous frame for stability check
+        self.stable_frame_count = 0  # How many frames the image has been stable
+
+        # Scale range
         self.match_scales = [
             0.3, 0.4, 0.5, 0.6, 0.75,
             1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0
@@ -55,10 +73,11 @@ class IconDetector:
         self.last_best_scale = 0
         self.last_runner_up_food = None
         self.last_runner_up_score = 0
+        self.last_image_diff = 0  # Pixel difference from previous frame
         self.total_scans = 0
         self.total_detections = 0
 
-        # Auto-save ALL scans for diagnostics
+        # Auto-save scans for diagnostics
         self.save_all_scans = False
         self.debug_dir = "debug_captures"
         self.debug_enabled = False
@@ -113,27 +132,51 @@ class IconDetector:
         fname = os.path.join(food_dir, f"ref_{existing + 1:03d}.png")
         cv2.imwrite(fname, crop_image)
 
-        # Reload references
         gray = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
         if food_name not in self.references:
             self.references[food_name] = []
         self.references[food_name].append(gray)
 
-        # Keep only last 5 per food
         if len(self.references[food_name]) > 5:
             self.references[food_name] = self.references[food_name][-5:]
 
         print(f"[LEARN] Saved reference for {food_name} ({existing + 1} total)")
 
+    def _check_image_stability(self, gray_crop):
+        """
+        Compare current frame with previous frame.
+        Returns (is_stable, mean_diff).
+        """
+        if self.prev_gray_crop is None:
+            self.prev_gray_crop = gray_crop.copy()
+            self.stable_frame_count = 0
+            return False, 0.0
+
+        # Ensure same shape
+        if self.prev_gray_crop.shape != gray_crop.shape:
+            self.prev_gray_crop = gray_crop.copy()
+            self.stable_frame_count = 0
+            return False, 0.0
+
+        # Calculate mean absolute pixel difference
+        diff = cv2.absdiff(gray_crop, self.prev_gray_crop)
+        mean_diff = float(np.mean(diff))
+
+        self.last_image_diff = mean_diff
+        self.prev_gray_crop = gray_crop.copy()
+
+        if mean_diff <= self.image_stability_threshold:
+            self.stable_frame_count += 1
+        else:
+            self.stable_frame_count = 0
+
+        is_stable = self.stable_frame_count >= self.required_stable_frames
+        return is_stable, mean_diff
+
     def identify_icon(self, crop_image):
         """
         Identify which food icon is in a cropped image.
-        Uses multi-scale template matching against both static templates
-        and learned references.
-
         Returns: (food_name, confidence) or (None, 0)
-
-        Also tracks runner-up match for confidence gap checking.
         """
         if crop_image is None or crop_image.size == 0:
             return None, 0
@@ -144,8 +187,7 @@ class IconDetector:
         gray = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
         ch, cw = gray.shape[:2]
 
-        # Track per-food best scores for gap analysis
-        food_scores = {}  # {food_name: (best_score, best_scale)}
+        food_scores = {}
 
         # Match against static templates
         for food, tmpl in self.gray_templates.items():
@@ -168,7 +210,7 @@ class IconDetector:
                 except Exception:
                     continue
 
-        # Match against learned references (higher weight — these are real popup crops)
+        # Match against learned references
         for food, ref_list in self.references.items():
             for ref_gray in ref_list:
                 rh, rw = ref_gray.shape[:2]
@@ -185,9 +227,7 @@ class IconDetector:
                         result = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
                         _, max_val, _, _ = cv2.minMaxLoc(result)
 
-                        # Give learned references a 10% boost
                         boosted = max_val * 1.1
-
                         if food not in food_scores or boosted > food_scores[food][0]:
                             food_scores[food] = (boosted, scale)
                     except Exception:
@@ -201,21 +241,18 @@ class IconDetector:
             self.last_runner_up_score = 0
             return None, 0
 
-        # Sort foods by score descending
         sorted_foods = sorted(food_scores.items(), key=lambda x: -x[1][0])
 
         best_food = sorted_foods[0][0]
         best_score = sorted_foods[0][1][0]
         best_scale = sorted_foods[0][1][1]
 
-        # Runner-up
         runner_up_food = None
         runner_up_score = 0
         if len(sorted_foods) > 1:
             runner_up_food = sorted_foods[1][0]
             runner_up_score = sorted_foods[1][1][0]
 
-        # Store for diagnostics
         self.last_best_food = best_food
         self.last_best_score = best_score
         self.last_best_scale = best_scale
@@ -223,40 +260,38 @@ class IconDetector:
         self.last_runner_up_score = runner_up_score
 
         if best_score >= self.match_threshold:
-            # Trust the best match — template matching on wheel icons produces
-            # inherently close scores (e.g. 52% vs 51%), so gap checking
-            # rejects virtually everything. The best scorer is the best guess.
             return best_food, best_score
         return None, 0
 
     def scan_crop(self, crop_image):
         """
-        Main detection method — state machine approach.
-        Always tries to identify. Logs once per popup appearance.
+        Main detection method — stability-verified state machine.
 
-        v13: No gap check — trusts best match above threshold.
-        - Time-based popup_active reset (after popup_timeout seconds)
-        - Different-food detection when popup_active
-        - Faster state reset (no_match_reset_count = 1)
+        v14: Two stability checks prevent spinning wheel false detection:
+        1. Same food must match 3+ consecutive scans
+        2. Image pixels must be stable (low diff) for 2+ frames
+
+        Only when BOTH conditions are met is a result logged.
         """
         if crop_image is None or crop_image.size == 0:
             self.last_scan_info = "Empty crop"
             return None, 0
 
         self.total_scans += 1
-
-        # Always try to identify
-        food, conf = self.identify_icon(crop_image)
         now = time.time()
 
-        # Build diagnostic info including runner-up
+        # Check image stability FIRST (before template matching)
+        gray_crop = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
+        is_stable, pixel_diff = self._check_image_stability(gray_crop)
+
+        # Try to identify food
+        food, conf = self.identify_icon(crop_image)
+
+        # Build diagnostic info
+        stability_str = f"stable={self.stable_frame_count}" if is_stable else f"MOVING(diff={pixel_diff:.1f})"
         if self.last_best_food:
-            gap_info = ""
-            if self.last_runner_up_food:
-                gap = self.last_best_score - self.last_runner_up_score
-                gap_info = f" gap={gap:.0%} vs {self.last_runner_up_food}"
             best_info = (f"{self.last_best_food} {self.last_best_score:.0%} "
-                         f"@{self.last_best_scale:.2f}x{gap_info}")
+                         f"@{self.last_best_scale:.2f}x")
         else:
             best_info = "no match"
 
@@ -264,56 +299,103 @@ class IconDetector:
         if self.save_all_scans or self.debug_enabled:
             self._save_scan(crop_image, food, conf)
 
-        # Time-based popup reset: if popup has been active too long, reset it
+        # Time-based popup reset
         if self.popup_active and (now - self.last_detection_time) > self.popup_timeout:
             self.popup_active = False
+            self.consecutive_food = None
+            self.consecutive_count = 0
             print(f"[STATE] Popup timeout ({self.popup_timeout}s), auto-reset")
 
         if food and conf >= self.match_threshold:
-            self.consecutive_no_match = 0
+            # Update consecutive tracking
+            if food == self.consecutive_food:
+                self.consecutive_count += 1
+            else:
+                self.consecutive_food = food
+                self.consecutive_count = 1
+
+            consec_str = f"x{self.consecutive_count}/{self.required_consecutive}"
+
+            # Check if we meet BOTH stability requirements
+            food_stable = self.consecutive_count >= self.required_consecutive
+            image_stable = is_stable
 
             if not self.popup_active:
-                # NEW popup detected
-                self.popup_active = True
-                self.last_detection_time = now
-                self.last_detected_food = food
-                self.total_detections += 1
+                if food_stable and image_stable:
+                    # CONFIRMED popup — both checks passed!
+                    self.popup_active = True
+                    self.last_detection_time = now
+                    self.last_detected_food = food
+                    self.total_detections += 1
+                    self.consecutive_no_match = 0
 
-                self.last_scan_info = (f"DETECTED: {food} ({conf:.0%}) "
-                                       f"@{self.last_best_scale:.1f}x [{best_info}]")
-                print(f"[DETECT] Round: {food} (conf: {conf:.1%}, "
-                      f"scale: {self.last_best_scale:.2f}x)")
-                return food, conf
+                    self.last_scan_info = (
+                        f"CONFIRMED: {food} ({conf:.0%}) "
+                        f"[{consec_str}, {stability_str}]")
+                    print(f"[DETECT] Confirmed: {food} (conf: {conf:.1%}, "
+                          f"consecutive: {self.consecutive_count}, "
+                          f"pixel_diff: {pixel_diff:.1f})")
+                    return food, conf
+
+                elif food_stable and not image_stable:
+                    # Food matches but image still changing — spinning wheel
+                    self.last_scan_info = (
+                        f"WAIT-UNSTABLE: {food} ({conf:.0%}) "
+                        f"[{consec_str}, diff={pixel_diff:.1f} > {self.image_stability_threshold}]")
+                    self.consecutive_no_match = 0
+                    return None, 0
+
+                else:
+                    # Building up consecutive count
+                    self.last_scan_info = (
+                        f"Building: {food} ({conf:.0%}) "
+                        f"[{consec_str}, {stability_str}]")
+                    self.consecutive_no_match = 0
+                    return None, 0
 
             elif food != self.last_detected_food:
-                # DIFFERENT food while popup still active — new round!
-                self.last_detection_time = now
-                self.last_detected_food = food
-                self.total_detections += 1
+                # Different food while popup active — new round?
+                if food_stable and image_stable:
+                    self.last_detection_time = now
+                    self.last_detected_food = food
+                    self.total_detections += 1
 
-                self.last_scan_info = (f"NEW FOOD: {food} ({conf:.0%}) "
-                                       f"[was {self.last_detected_food}]")
-                print(f"[DETECT] New food: {food} (was {self.last_detected_food}, "
-                      f"conf: {conf:.1%})")
-                return food, conf
+                    self.last_scan_info = (
+                        f"NEW FOOD: {food} ({conf:.0%}) "
+                        f"[was {self.last_detected_food}]")
+                    print(f"[DETECT] New food: {food} (was {self.last_detected_food})")
+                    return food, conf
+                else:
+                    self.last_scan_info = (
+                        f"New? {food} ({conf:.0%}) "
+                        f"[{consec_str}, {stability_str}] not stable yet")
+                    return None, 0
             else:
-                # Same food still showing — skip
+                # Same food still showing
                 elapsed = now - self.last_detection_time
-                self.last_scan_info = (f"Active: {food} ({conf:.0%}) "
-                                       f"[{elapsed:.0f}s] skip")
+                self.last_scan_info = (
+                    f"Active: {food} ({conf:.0%}) "
+                    f"[{elapsed:.0f}s] skip")
+                self.consecutive_no_match = 0
                 return None, 0
         else:
+            # No match above threshold
             self.consecutive_no_match += 1
+            # Reset consecutive tracking when no food matches
+            self.consecutive_food = None
+            self.consecutive_count = 0
 
             if self.consecutive_no_match >= self.no_match_reset_count:
                 if self.popup_active:
                     self.popup_active = False
-                    self.last_scan_info = f"Popup gone ({best_info}), ready"
+                    self.last_scan_info = f"Popup gone ({best_info}), ready [{stability_str}]"
                     print(f"[STATE] Popup gone, ready for next")
                 else:
-                    self.last_scan_info = f"Waiting ({best_info})"
+                    self.last_scan_info = f"Waiting ({best_info}) [{stability_str}]"
             else:
-                self.last_scan_info = f"No match x{self.consecutive_no_match} ({best_info})"
+                self.last_scan_info = (
+                    f"No match x{self.consecutive_no_match} "
+                    f"({best_info}) [{stability_str}]")
 
             return None, 0
 
@@ -323,10 +405,11 @@ class IconDetector:
         self.scan_save_count += 1
 
         best = f"{self.last_best_food}_{self.last_best_score:.0%}" if self.last_best_food else "none_0%"
+        stable = f"S{self.stable_frame_count}" if self.stable_frame_count > 0 else f"M{self.last_image_diff:.0f}"
         state = "DET" if food else "wait"
         fname = os.path.join(
             self.debug_dir,
-            f"scan_{self.scan_save_count:05d}_{state}_{best}.png")
+            f"scan_{self.scan_save_count:05d}_{state}_{best}_{stable}.png")
         cv2.imwrite(fname, image)
 
         # Keep only last 100

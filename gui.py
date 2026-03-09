@@ -1,11 +1,11 @@
 """
-Statistics GUI for Greedy Cat Result Logger v13
+Statistics GUI for Greedy Cat Result Logger v14
 Shows history as game icons, hot/cold items, percentages, streaks.
 Dark theme matching reference software style.
 
-v13: Removed confidence gap requirement — was blocking ALL detections.
-     Template matching on wheel icons produces inherently close scores.
-     Trust best match above threshold.
+v14: Stability-based detection — prevents detecting spinning wheel icons.
+     Requires same food matched 3x consecutive + image pixel stability.
+     Only logs when popup is truly static on screen.
 """
 
 import tkinter as tk
@@ -79,7 +79,7 @@ class StatsGUI:
 
         # Log startup info
         self._log("="*50)
-        self._log("Greedy Cat Result Logger v13 STARTED")
+        self._log("Greedy Cat Result Logger v14 STARTED")
         self._log(f"Detector: {len(self.detector.templates) if self.detector else 0} templates loaded")
         self._log(f"Capturer: {'available' if self.capturer else 'NOT available'}")
         ix = self.settings.get("icon_center_x", 0)
@@ -419,24 +419,37 @@ class StatsGUI:
                 self.preview_score_label.config(
                     text=f"Score: {score:.1%}  |  Scale: {scale:.2f}x  |  Threshold: {threshold:.0%}")
 
-                # Runner-up and gap info
-                runner = self.detector.last_runner_up_food
-                runner_score = self.detector.last_runner_up_score
-                if runner:
-                    gap = score - runner_score
-                    gap_color = self.GREEN if gap >= 0.10 else "#d29922" if gap >= 0.05 else self.RED
-                    rd = FOOD_DISPLAY.get(runner, {})
-                    self.preview_gap_label.config(
-                        text=f"Runner-up: {rd.get('name', runner)} ({runner_score:.1%}) | Gap: {gap:.1%}",
-                        fg=gap_color)
+                # Stability info
+                consec = self.detector.consecutive_count
+                consec_food = self.detector.consecutive_food or "--"
+                req = self.detector.required_consecutive
+                img_diff = self.detector.last_image_diff
+                stable_frames = self.detector.stable_frame_count
+                req_stable = self.detector.required_stable_frames
+
+                if consec >= req and stable_frames >= req_stable:
+                    stab_color = self.GREEN
+                    stab_text = f"STABLE: {consec_food} x{consec}/{req} | img stable x{stable_frames} (diff={img_diff:.1f})"
+                elif img_diff > self.detector.image_stability_threshold:
+                    stab_color = self.RED
+                    stab_text = f"SPINNING: diff={img_diff:.1f} | {consec_food} x{consec}/{req}"
                 else:
-                    self.preview_gap_label.config(
-                        text="Runner-up: none", fg=self.TEXT_DIM)
+                    stab_color = "#d29922"
+                    stab_text = f"Building: {consec_food} x{consec}/{req} | diff={img_diff:.1f} stable={stable_frames}/{req_stable}"
+
+                self.preview_gap_label.config(text=stab_text, fg=stab_color)
             else:
                 self.preview_match_label.config(
                     text="Best match: --", fg=self.TEXT_DIM)
-                self.preview_gap_label.config(
-                    text="Runner-up: --", fg=self.TEXT_DIM)
+                img_diff = self.detector.last_image_diff
+                if img_diff > self.detector.image_stability_threshold:
+                    self.preview_gap_label.config(
+                        text=f"SPINNING: diff={img_diff:.1f} — waiting for popup",
+                        fg=self.RED)
+                else:
+                    self.preview_gap_label.config(
+                        text=f"No match | diff={img_diff:.1f}",
+                        fg=self.TEXT_DIM)
 
             # State
             state = self.detector.last_scan_info
@@ -1310,7 +1323,7 @@ class StatsGUI:
                 best = self.detector.last_best_food
                 score = self.detector.last_best_score
                 if best:
-                    detect_text = f"No match yet (best: {best} at {score:.0%}, threshold: 42%)"
+                    detect_text = f"No match yet (best: {best} at {score:.0%}, threshold: {self.detector.match_threshold:.0%})"
                 else:
                     detect_text = "No match — popup may not be visible right now (that's OK)"
                 detect_color = "#d29922"
@@ -1403,6 +1416,11 @@ class StatsGUI:
                 self.detector.save_all_scans = True
                 self.detector.popup_active = False
                 self.detector.consecutive_no_match = 0
+                # Reset stability tracking
+                self.detector.consecutive_food = None
+                self.detector.consecutive_count = 0
+                self.detector.prev_gray_crop = None
+                self.detector.stable_frame_count = 0
 
             # Reset scan count for this session
             self.scan_count = 0
@@ -1521,16 +1539,14 @@ class StatsGUI:
         # Run detection (state machine handles logging logic)
         food_name, confidence = self.detector.scan_crop(crop)
 
-        # Log detection result with runner-up info
+        # Log detection result with stability info
         det_info = self.detector.last_scan_info
-        runner = self.detector.last_runner_up_food
-        runner_score = self.detector.last_runner_up_score
-        runner_str = f" (runner-up: {runner} {runner_score:.0%})" if runner else ""
+        img_diff = self.detector.last_image_diff
 
         if food_name:
-            self._log(f"DETECTED: {food_name} ({confidence:.0%}){runner_str} — {det_info}", "DETECT")
-        elif self.scan_count <= 10:
-            self._log(f"Scan #{self.scan_count}: {det_info}{runner_str}")
+            self._log(f"CONFIRMED: {food_name} ({confidence:.0%}) — {det_info}", "DETECT")
+        elif self.scan_count <= 10 or self.scan_count % 20 == 0:
+            self._log(f"Scan #{self.scan_count}: {det_info}")
 
         # Update preview and diagnostics on main thread
         self.root.after(0, self._update_preview)
