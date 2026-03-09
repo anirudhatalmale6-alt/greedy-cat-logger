@@ -1,12 +1,13 @@
 """
-Statistics GUI for Greedy Cat Result Logger v11
+Statistics GUI for Greedy Cat Result Logger v12
 Shows history as game icons, hot/cold items, percentages, streaks.
 Dark theme matching reference software style.
 
-v11: Comprehensive diagnostics — ALL errors visible in GUI log panel.
-     Every scan writes to diagnostic log + log file.
-     Capture stats (mean brightness, std deviation) shown per scan.
-     Errors no longer hidden in console.
+v12: Detection accuracy fixes:
+     - Confidence gap display (best vs runner-up)
+     - Time-based state reset info
+     - Better scan logging with runner-up info
+     - Auto-enable debug saves for first 50 scans
 """
 
 import tkinter as tk
@@ -80,7 +81,7 @@ class StatsGUI:
 
         # Log startup info
         self._log("="*50)
-        self._log("Greedy Cat Result Logger v11 STARTED")
+        self._log("Greedy Cat Result Logger v12 STARTED")
         self._log(f"Detector: {len(self.detector.templates) if self.detector else 0} templates loaded")
         self._log(f"Capturer: {'available' if self.capturer else 'NOT available'}")
         ix = self.settings.get("icon_center_x", 0)
@@ -348,10 +349,16 @@ class StatsGUI:
         self.preview_match_label.pack(fill="x")
 
         self.preview_score_label = tk.Label(
-            info_frame, text="Score: --  |  Scale: --  |  Threshold: 35%",
+            info_frame, text="Score: --  |  Scale: --  |  Threshold: 42%",
             font=("Consolas", 9), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
         )
         self.preview_score_label.pack(fill="x")
+
+        self.preview_gap_label = tk.Label(
+            info_frame, text="Runner-up: --",
+            font=("Consolas", 8), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
+        )
+        self.preview_gap_label.pack(fill="x")
 
         self.preview_state_label = tk.Label(
             info_frame, text="State: Stopped",
@@ -413,9 +420,25 @@ class StatsGUI:
                     text=f"Best match: {name}", fg=color)
                 self.preview_score_label.config(
                     text=f"Score: {score:.1%}  |  Scale: {scale:.2f}x  |  Threshold: {threshold:.0%}")
+
+                # Runner-up and gap info
+                runner = self.detector.last_runner_up_food
+                runner_score = self.detector.last_runner_up_score
+                if runner:
+                    gap = score - runner_score
+                    gap_color = self.GREEN if gap >= 0.10 else "#d29922" if gap >= 0.05 else self.RED
+                    rd = FOOD_DISPLAY.get(runner, {})
+                    self.preview_gap_label.config(
+                        text=f"Runner-up: {rd.get('name', runner)} ({runner_score:.1%}) | Gap: {gap:.1%}",
+                        fg=gap_color)
+                else:
+                    self.preview_gap_label.config(
+                        text="Runner-up: none", fg=self.TEXT_DIM)
             else:
                 self.preview_match_label.config(
                     text="Best match: --", fg=self.TEXT_DIM)
+                self.preview_gap_label.config(
+                    text="Runner-up: --", fg=self.TEXT_DIM)
 
             # State
             state = self.detector.last_scan_info
@@ -1289,7 +1312,7 @@ class StatsGUI:
                 best = self.detector.last_best_food
                 score = self.detector.last_best_score
                 if best:
-                    detect_text = f"No match yet (best: {best} at {score:.0%}, threshold: 35%)"
+                    detect_text = f"No match yet (best: {best} at {score:.0%}, threshold: 42%)"
                 else:
                     detect_text = "No match — popup may not be visible right now (that's OK)"
                 detect_color = "#d29922"
@@ -1377,9 +1400,9 @@ class StatsGUI:
 
             # Apply settings to detector
             if self.detector:
-                debug = self.settings.get("debug_saves", False)
-                self.detector.debug_enabled = debug
-                self.detector.save_all_scans = debug
+                # Always enable debug saves so we can diagnose issues
+                self.detector.debug_enabled = True
+                self.detector.save_all_scans = True
                 self.detector.popup_active = False
                 self.detector.consecutive_no_match = 0
 
@@ -1478,8 +1501,8 @@ class StatsGUI:
             except Exception:
                 pass
 
-        # Auto-save first 20 scans for diagnostics (always, no checkbox needed)
-        if self.scan_count <= 20:
+        # Auto-save first 50 scans for diagnostics (always, no checkbox needed)
+        if self.scan_count <= 50:
             debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
             os.makedirs(debug_dir, exist_ok=True)
             cv2.imwrite(os.path.join(debug_dir, f"auto_scan_{self.scan_count:03d}.png"), crop)
@@ -1489,8 +1512,8 @@ class StatsGUI:
         if std_val < 5:
             self._log(f"Scan #{self.scan_count}: BLACK/UNIFORM image! "
                       f"mean={mean_val:.0f} std={std_val:.1f}{change_str} via {method}", "ERROR")
-        elif self.scan_count <= 5 or self.scan_count % 10 == 0:
-            # Log first 5 scans and every 10th after
+        elif self.scan_count <= 10 or self.scan_count % 10 == 0:
+            # Log first 10 scans and every 10th after
             self._log(f"Scan #{self.scan_count}: {crop.shape[1]}x{crop.shape[0]} "
                       f"mean={mean_val:.0f} std={std_val:.1f}{change_str} via {method}")
 
@@ -1500,12 +1523,16 @@ class StatsGUI:
         # Run detection (state machine handles logging logic)
         food_name, confidence = self.detector.scan_crop(crop)
 
-        # Log detection result
+        # Log detection result with runner-up info
         det_info = self.detector.last_scan_info
+        runner = self.detector.last_runner_up_food
+        runner_score = self.detector.last_runner_up_score
+        runner_str = f" (runner-up: {runner} {runner_score:.0%})" if runner else ""
+
         if food_name:
-            self._log(f"DETECTED: {food_name} ({confidence:.0%}) — {det_info}", "DETECT")
-        elif self.scan_count <= 5:
-            self._log(f"Scan #{self.scan_count}: {det_info}")
+            self._log(f"DETECTED: {food_name} ({confidence:.0%}){runner_str} — {det_info}", "DETECT")
+        elif self.scan_count <= 10:
+            self._log(f"Scan #{self.scan_count}: {det_info}{runner_str}")
 
         # Update preview and diagnostics on main thread
         self.root.after(0, self._update_preview)

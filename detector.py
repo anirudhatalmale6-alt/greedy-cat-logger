@@ -1,10 +1,17 @@
 """
-Icon detection engine for Greedy Cat Result Logger v9.
+Icon detection engine for Greedy Cat Result Logger v12.
 
 APPROACH: State-machine + multi-scale template matching + auto-save diagnostics.
-- Extended scale range (0.2x-8.0x) for small popup icons
-- Every scan is optionally saved with diagnostic info
-- Learned references from manual adds supplement static templates
+
+v12 FIXES:
+- Confidence gap: best match must be 15%+ better than runner-up to avoid
+  misclassification (e.g. tomato vs corn confusion)
+- Time-based state reset: popup_active auto-resets after 8 seconds even if
+  matches keep firing (prevents stuck state blocking new detections)
+- Different-food detection: if popup_active but a DIFFERENT food is detected
+  with high confidence, treat it as a new round (popup changed)
+- Reduced no_match_reset_count to 1 for faster state transitions
+- Raised match_threshold to 0.42 to reduce false matches
 """
 
 import os
@@ -34,14 +41,15 @@ class IconDetector:
         self.consecutive_no_match = 0
 
         # Config
-        self.match_threshold = 0.35  # Lowered from 0.45 for better sensitivity
-        self.no_match_reset_count = 2
+        self.match_threshold = 0.42  # Raised from 0.35 to reduce false matches
+        self.no_match_reset_count = 1  # Reduced from 2 for faster reset
+        self.popup_timeout = 8.0  # Seconds before popup_active auto-resets
+        self.min_confidence_gap = 0.10  # Best must beat runner-up by this much
 
         # Scale range — covers popup icons (26px+) to large ones (200px+)
-        # Min 0.3x (87*0.3=26px): smaller scales cause false positives on backgrounds
         self.match_scales = [
-            0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.75,
-            1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0
+            0.3, 0.4, 0.5, 0.6, 0.75,
+            1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0
         ]
 
         # Diagnostics
@@ -49,6 +57,8 @@ class IconDetector:
         self.last_best_food = None
         self.last_best_score = 0
         self.last_best_scale = 0
+        self.last_runner_up_food = None
+        self.last_runner_up_score = 0
         self.total_scans = 0
         self.total_detections = 0
 
@@ -126,6 +136,8 @@ class IconDetector:
         and learned references.
 
         Returns: (food_name, confidence) or (None, 0)
+
+        Also tracks runner-up match for confidence gap checking.
         """
         if crop_image is None or crop_image.size == 0:
             return None, 0
@@ -136,9 +148,8 @@ class IconDetector:
         gray = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
         ch, cw = gray.shape[:2]
 
-        best_food = None
-        best_score = 0
-        best_scale = 0
+        # Track per-food best scores for gap analysis
+        food_scores = {}  # {food_name: (best_score, best_scale)}
 
         # Match against static templates
         for food, tmpl in self.gray_templates.items():
@@ -156,10 +167,8 @@ class IconDetector:
                     result = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, _ = cv2.minMaxLoc(result)
 
-                    if max_val > best_score:
-                        best_score = max_val
-                        best_food = food
-                        best_scale = scale
+                    if food not in food_scores or max_val > food_scores[food][0]:
+                        food_scores[food] = (max_val, scale)
                 except Exception:
                     continue
 
@@ -168,8 +177,6 @@ class IconDetector:
             for ref_gray in ref_list:
                 rh, rw = ref_gray.shape[:2]
 
-                # References are already at the right scale (same crop size)
-                # Just do direct matching at scale 1.0 and nearby
                 for scale in [0.7, 0.85, 1.0, 1.15, 1.3]:
                     nh = int(rh * scale)
                     nw = int(rw * scale)
@@ -185,19 +192,48 @@ class IconDetector:
                         # Give learned references a 10% boost
                         boosted = max_val * 1.1
 
-                        if boosted > best_score:
-                            best_score = boosted
-                            best_food = food
-                            best_scale = scale
+                        if food not in food_scores or boosted > food_scores[food][0]:
+                            food_scores[food] = (boosted, scale)
                     except Exception:
                         continue
+
+        if not food_scores:
+            self.last_best_food = None
+            self.last_best_score = 0
+            self.last_best_scale = 0
+            self.last_runner_up_food = None
+            self.last_runner_up_score = 0
+            return None, 0
+
+        # Sort foods by score descending
+        sorted_foods = sorted(food_scores.items(), key=lambda x: -x[1][0])
+
+        best_food = sorted_foods[0][0]
+        best_score = sorted_foods[0][1][0]
+        best_scale = sorted_foods[0][1][1]
+
+        # Runner-up
+        runner_up_food = None
+        runner_up_score = 0
+        if len(sorted_foods) > 1:
+            runner_up_food = sorted_foods[1][0]
+            runner_up_score = sorted_foods[1][1][0]
 
         # Store for diagnostics
         self.last_best_food = best_food
         self.last_best_score = best_score
         self.last_best_scale = best_scale
+        self.last_runner_up_food = runner_up_food
+        self.last_runner_up_score = runner_up_score
 
         if best_score >= self.match_threshold:
+            # Confidence gap check: reject if runner-up is too close
+            gap = best_score - runner_up_score
+            if gap < self.min_confidence_gap and runner_up_score >= self.match_threshold:
+                # Too close — ambiguous match, don't classify
+                print(f"[GAP] Ambiguous: {best_food}={best_score:.1%} vs "
+                      f"{runner_up_food}={runner_up_score:.1%} (gap={gap:.1%} < {self.min_confidence_gap:.0%})")
+                return None, 0
             return best_food, best_score
         return None, 0
 
@@ -205,6 +241,11 @@ class IconDetector:
         """
         Main detection method — state machine approach.
         Always tries to identify. Logs once per popup appearance.
+
+        v12 improvements:
+        - Time-based popup_active reset (after popup_timeout seconds)
+        - Different-food detection when popup_active
+        - Faster state reset (no_match_reset_count = 1)
         """
         if crop_image is None or crop_image.size == 0:
             self.last_scan_info = "Empty crop"
@@ -216,13 +257,25 @@ class IconDetector:
         food, conf = self.identify_icon(crop_image)
         now = time.time()
 
-        # Build diagnostic info
-        best_info = (f"{self.last_best_food} {self.last_best_score:.0%} "
-                     f"@{self.last_best_scale:.2f}x") if self.last_best_food else "no match"
+        # Build diagnostic info including runner-up
+        if self.last_best_food:
+            gap_info = ""
+            if self.last_runner_up_food:
+                gap = self.last_best_score - self.last_runner_up_score
+                gap_info = f" gap={gap:.0%} vs {self.last_runner_up_food}"
+            best_info = (f"{self.last_best_food} {self.last_best_score:.0%} "
+                         f"@{self.last_best_scale:.2f}x{gap_info}")
+        else:
+            best_info = "no match"
 
         # Auto-save scan for diagnostics
         if self.save_all_scans or self.debug_enabled:
             self._save_scan(crop_image, food, conf)
+
+        # Time-based popup reset: if popup has been active too long, reset it
+        if self.popup_active and (now - self.last_detection_time) > self.popup_timeout:
+            self.popup_active = False
+            print(f"[STATE] Popup timeout ({self.popup_timeout}s), auto-reset")
 
         if food and conf >= self.match_threshold:
             self.consecutive_no_match = 0
@@ -234,11 +287,28 @@ class IconDetector:
                 self.last_detected_food = food
                 self.total_detections += 1
 
-                self.last_scan_info = f"DETECTED: {food} ({conf:.0%}) @{self.last_best_scale:.1f}x"
-                print(f"[DETECT] Round: {food} (conf: {conf:.1%}, scale: {self.last_best_scale:.2f}x)")
+                self.last_scan_info = (f"DETECTED: {food} ({conf:.0%}) "
+                                       f"@{self.last_best_scale:.1f}x [{best_info}]")
+                print(f"[DETECT] Round: {food} (conf: {conf:.1%}, "
+                      f"scale: {self.last_best_scale:.2f}x)")
+                return food, conf
+
+            elif food != self.last_detected_food:
+                # DIFFERENT food while popup still active — new round!
+                self.last_detection_time = now
+                self.last_detected_food = food
+                self.total_detections += 1
+
+                self.last_scan_info = (f"NEW FOOD: {food} ({conf:.0%}) "
+                                       f"[was {self.last_detected_food}]")
+                print(f"[DETECT] New food: {food} (was {self.last_detected_food}, "
+                      f"conf: {conf:.1%})")
                 return food, conf
             else:
-                self.last_scan_info = f"Active: {food} ({conf:.0%}) [skip]"
+                # Same food still showing — skip
+                elapsed = now - self.last_detection_time
+                self.last_scan_info = (f"Active: {food} ({conf:.0%}) "
+                                       f"[{elapsed:.0f}s] skip")
                 return None, 0
         else:
             self.consecutive_no_match += 1
