@@ -13,6 +13,7 @@ import json
 from datetime import datetime
 from PIL import Image, ImageTk
 from config import FOOD_ITEMS, FOOD_DISPLAY, FOOD_MULTIPLIER, TEMPLATES_DIR
+from predictor import Predictor
 
 
 class StatsGUI:
@@ -42,6 +43,7 @@ class StatsGUI:
         self.monitor_thread = None
         self.previous_strip_hash = ""
         self.scan_count = 0
+        self.predictor = Predictor()
 
         # Icon image cache
         self.icons = {}  # {food_name: {size: PhotoImage}}
@@ -154,6 +156,7 @@ class StatsGUI:
         self._build_header()
         self._build_controls()
         self._build_summary_cards()
+        self._build_prediction()
         self._build_recent_results()
         self._build_hot_cold()
         self._build_stats_table()
@@ -247,6 +250,80 @@ class StatsGUI:
         val.pack(pady=(0, 6))
         card._value_label = val
         return card
+
+    # ===================== NEXT ROUND PREDICTION =====================
+    def _build_prediction(self):
+        section = tk.Frame(self.main_frame, bg=self.BG_COLOR)
+        section.pack(fill="x", padx=10, pady=4)
+
+        tk.Label(section, text="NEXT ROUND PROBABILITY",
+                 font=("Segoe UI", 10, "bold"), fg="#c9d1d9",
+                 bg=self.BG_COLOR, anchor="w").pack(fill="x", pady=(4, 2))
+
+        pred_frame = tk.Frame(section, bg=self.CARD_BG, padx=10, pady=8)
+        pred_frame.pack(fill="x")
+
+        # Accent bar
+        tk.Frame(pred_frame, bg="#8957e5", height=2).pack(fill="x", pady=(0, 6))
+
+        # Top 3 prediction slots
+        self.pred_slots = []
+        slots_frame = tk.Frame(pred_frame, bg=self.CARD_BG)
+        slots_frame.pack(fill="x")
+
+        for i in range(3):
+            slot = tk.Frame(slots_frame, bg=self.CARD_BG)
+            slot.pack(side="left", fill="x", expand=True, padx=4)
+
+            # Rank badge
+            rank_colors = ["#FFD700", "#C0C0C0", "#CD7F32"]
+            rank_labels = ["1st", "2nd", "3rd"]
+
+            rank_lbl = tk.Label(slot, text=rank_labels[i],
+                                font=("Segoe UI", 8, "bold"),
+                                fg=rank_colors[i], bg=self.CARD_BG)
+            rank_lbl.pack()
+
+            # Icon
+            icon_lbl = tk.Label(slot, bg=self.CARD_BG)
+            icon_lbl.pack(pady=2)
+
+            # Name
+            name_lbl = tk.Label(slot, text="--",
+                                font=("Segoe UI", 11, "bold"),
+                                fg=self.TEXT_COLOR, bg=self.CARD_BG)
+            name_lbl.pack()
+
+            # Probability bar
+            bar_outer = tk.Frame(slot, bg="#21262d", height=10, width=120)
+            bar_outer.pack(pady=2)
+            bar_outer.pack_propagate(False)
+            bar_fill = tk.Frame(bar_outer, bg="#8957e5", height=10)
+            bar_fill.place(x=0, y=0, relheight=1.0, width=0)
+
+            # Percentage
+            pct_lbl = tk.Label(slot, text="0%",
+                               font=("Segoe UI", 14, "bold"),
+                               fg="#8957e5", bg=self.CARD_BG)
+            pct_lbl.pack()
+
+            # Reason
+            reason_lbl = tk.Label(slot, text="",
+                                  font=("Segoe UI", 7),
+                                  fg=self.TEXT_DIM, bg=self.CARD_BG,
+                                  wraplength=130)
+            reason_lbl.pack()
+
+            self.pred_slots.append({
+                "icon": icon_lbl, "name": name_lbl,
+                "bar_outer": bar_outer, "bar_fill": bar_fill,
+                "pct": pct_lbl, "reason": reason_lbl,
+            })
+
+        # Note
+        tk.Label(pred_frame,
+                 text="Based on frequency, recency, streaks & patterns (statistical estimate)",
+                 font=("Segoe UI", 7), fg="#484f58", bg=self.CARD_BG).pack(pady=(6, 0))
 
     # ===================== RECENT RESULTS STRIP =====================
     def _build_recent_results(self):
@@ -576,6 +653,29 @@ class StatsGUI:
             self.history_text.insert("end", line)
         self.history_text.config(state="disabled")
 
+        # --- Predictions ---
+        top_preds = self.predictor.get_top_predictions(self.logger.results, n=3)
+        for i, slot in enumerate(self.pred_slots):
+            if i < len(top_preds):
+                food, data = top_preds[i]
+                d = FOOD_DISPLAY.get(food, {})
+                icon = self._get_icon(food, "card")
+                if icon:
+                    slot["icon"].config(image=icon)
+                slot["name"].config(text=d.get("name", food))
+                prob = data["probability"]
+                slot["pct"].config(text=f"{prob:.1f}%")
+                # Bar width (max ~120px)
+                bar_w = int((prob / 100) * 120)
+                slot["bar_fill"].place(x=0, y=0, relheight=1.0, width=max(bar_w, 2))
+                # Reasons
+                reasons = data.get("reasons", [])
+                slot["reason"].config(text=" | ".join(reasons[:2]))
+            else:
+                slot["name"].config(text="--")
+                slot["pct"].config(text="0%")
+                slot["reason"].config(text="")
+
         # --- Status ---
         self.time_label.config(text=datetime.now().strftime("%H:%M:%S"))
         self.scan_label.config(text=f"Scans: {self.scan_count}")
@@ -710,9 +810,42 @@ class StatsGUI:
             except ValueError:
                 messagebox.showerror("Error", "Please enter valid numbers.")
 
-        tk.Button(dialog, text="Apply", font=("Segoe UI", 10, "bold"),
+        btn_frame = tk.Frame(dialog, bg=self.BG_COLOR)
+        btn_frame.pack(pady=10)
+
+        def find_emulator():
+            if self.capturer:
+                win = self.capturer.find_emulator_window()
+                if win:
+                    # Auto-fill with bottom strip of emulator window
+                    # Result row is typically at the very bottom ~5% of the game
+                    emu_bottom_y = win["top"] + int(win["height"] * 0.92)
+                    entries["region_x"].delete(0, "end")
+                    entries["region_x"].insert(0, str(win["left"] + 10))
+                    entries["region_y"].delete(0, "end")
+                    entries["region_y"].insert(0, str(emu_bottom_y))
+                    entries["region_w"].delete(0, "end")
+                    entries["region_w"].insert(0, str(int(win["width"] * 0.6)))
+                    entries["region_h"].delete(0, "end")
+                    entries["region_h"].insert(0, str(int(win["height"] * 0.06)))
+                    messagebox.showinfo("Found",
+                        f"Found: {win['title']}\n"
+                        f"Position: ({win['left']}, {win['top']})\n"
+                        f"Size: {win['width']}x{win['height']}\n\n"
+                        "Auto-filled approximate Result row region.\n"
+                        "Adjust if needed, then click Apply.")
+                else:
+                    messagebox.showwarning("Not Found",
+                        "No emulator window found.\n"
+                        "Make sure BlueStacks/LDPlayer is open.")
+
+        tk.Button(btn_frame, text="Find Emulator", font=("Segoe UI", 9),
+                  bg="#1f6feb", fg="white", relief="flat", padx=12, pady=5,
+                  command=find_emulator).pack(side="left", padx=5)
+
+        tk.Button(btn_frame, text="Apply", font=("Segoe UI", 10, "bold"),
                   bg="#238636", fg="white", relief="flat", padx=20, pady=5,
-                  command=apply).pack(pady=10)
+                  command=apply).pack(side="left", padx=5)
 
     def _manual_add(self):
         dialog = tk.Toplevel(self.root)

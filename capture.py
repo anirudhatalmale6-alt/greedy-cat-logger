@@ -4,15 +4,24 @@ import time
 import mss
 import numpy as np
 import cv2
-from PIL import Image
 
 
 class ScreenCapture:
     """Handles screen capture from the emulator window."""
 
+    # Common emulator window titles
+    EMULATOR_TITLES = [
+        "BlueStacks App Player",
+        "BlueStacks",
+        "LDPlayer",
+        "NoxPlayer",
+        "MEmu",
+        "Xena",
+    ]
+
     def __init__(self):
         self.sct = mss.mss()
-        self.result_region = None  # (x, y, width, height) - the Result row area
+        self.result_region = None
         self.last_capture = None
         self.last_capture_time = 0
 
@@ -28,7 +37,6 @@ class ScreenCapture:
         try:
             screenshot = self.sct.grab(self.result_region)
             img = np.array(screenshot)
-            # MSS captures in BGRA, convert to BGR for OpenCV
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
             self.last_capture = img
             self.last_capture_time = time.time()
@@ -40,7 +48,7 @@ class ScreenCapture:
     def capture_full_screen(self):
         """Capture the full primary screen."""
         try:
-            monitor = self.sct.monitors[1]  # Primary monitor
+            monitor = self.sct.monitors[1]
             screenshot = self.sct.grab(monitor)
             img = np.array(screenshot)
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
@@ -61,20 +69,54 @@ class ScreenCapture:
             print(f"Region capture error: {e}")
             return None
 
-    def capture_emulator_window(self, window_title="LDPlayer"):
+    def find_emulator_window(self):
         """
-        Try to find and capture the emulator window.
-        Falls back to full screen if window not found.
+        Find the emulator window (BlueStacks, LDPlayer, etc).
+        Returns (x, y, width, height) or None.
         """
         try:
             import pyautogui
-            windows = pyautogui.getWindowsWithTitle(window_title)
-            if windows:
-                win = windows[0]
-                return self.capture_region(win.left, win.top, win.width, win.height)
+            for title in self.EMULATOR_TITLES:
+                windows = pyautogui.getWindowsWithTitle(title)
+                if windows:
+                    win = windows[0]
+                    return {
+                        "title": title,
+                        "left": win.left,
+                        "top": win.top,
+                        "width": win.width,
+                        "height": win.height,
+                    }
         except Exception:
             pass
-        return self.capture_full_screen()
+
+        # Fallback: try win32gui on Windows
+        try:
+            import win32gui
+
+            found = {}
+
+            def enum_handler(hwnd, results):
+                if win32gui.IsWindowVisible(hwnd):
+                    title = win32gui.GetWindowText(hwnd)
+                    for emu_title in self.EMULATOR_TITLES:
+                        if emu_title.lower() in title.lower():
+                            rect = win32gui.GetWindowRect(hwnd)
+                            results["found"] = {
+                                "title": title,
+                                "left": rect[0],
+                                "top": rect[1],
+                                "width": rect[2] - rect[0],
+                                "height": rect[3] - rect[1],
+                            }
+
+            win32gui.EnumWindows(enum_handler, found)
+            if "found" in found:
+                return found["found"]
+        except ImportError:
+            pass
+
+        return None
 
     @staticmethod
     def image_changed(img1, img2, threshold=5):
