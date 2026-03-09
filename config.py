@@ -47,7 +47,7 @@ CAPTURE_INTERVAL_MS = 2000  # Check screen every 2 seconds
 RESULT_REGION = None  # Will be set during calibration (x, y, width, height)
 
 # Detection settings
-MATCH_THRESHOLD = 0.42  # OpenCV template matching threshold
+MATCH_THRESHOLD = 0.38  # OpenCV template matching threshold
 
 # File paths
 CSV_FILENAME = "greedy_cat_results.csv"

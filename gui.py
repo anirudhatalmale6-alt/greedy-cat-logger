@@ -1,13 +1,11 @@
 """
-Statistics GUI for Greedy Cat Result Logger v12
+Statistics GUI for Greedy Cat Result Logger v13
 Shows history as game icons, hot/cold items, percentages, streaks.
 Dark theme matching reference software style.
 
-v12: Detection accuracy fixes:
-     - Confidence gap display (best vs runner-up)
-     - Time-based state reset info
-     - Better scan logging with runner-up info
-     - Auto-enable debug saves for first 50 scans
+v13: Removed confidence gap requirement — was blocking ALL detections.
+     Template matching on wheel icons produces inherently close scores.
+     Trust best match above threshold.
 """
 
 import tkinter as tk
@@ -81,7 +79,7 @@ class StatsGUI:
 
         # Log startup info
         self._log("="*50)
-        self._log("Greedy Cat Result Logger v12 STARTED")
+        self._log("Greedy Cat Result Logger v13 STARTED")
         self._log(f"Detector: {len(self.detector.templates) if self.detector else 0} templates loaded")
         self._log(f"Capturer: {'available' if self.capturer else 'NOT available'}")
         ix = self.settings.get("icon_center_x", 0)
@@ -349,7 +347,7 @@ class StatsGUI:
         self.preview_match_label.pack(fill="x")
 
         self.preview_score_label = tk.Label(
-            info_frame, text="Score: --  |  Scale: --  |  Threshold: 42%",
+            info_frame, text="Score: --  |  Scale: --  |  Threshold: 38%",
             font=("Consolas", 9), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
         )
         self.preview_score_label.pack(fill="x")

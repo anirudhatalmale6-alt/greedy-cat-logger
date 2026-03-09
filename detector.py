@@ -1,17 +1,14 @@
 """
-Icon detection engine for Greedy Cat Result Logger v12.
+Icon detection engine for Greedy Cat Result Logger v13.
 
 APPROACH: State-machine + multi-scale template matching + auto-save diagnostics.
 
-v12 FIXES:
-- Confidence gap: best match must be 15%+ better than runner-up to avoid
-  misclassification (e.g. tomato vs corn confusion)
-- Time-based state reset: popup_active auto-resets after 8 seconds even if
-  matches keep firing (prevents stuck state blocking new detections)
-- Different-food detection: if popup_active but a DIFFERENT food is detected
-  with high confidence, treat it as a new round (popup changed)
-- Reduced no_match_reset_count to 1 for faster state transitions
-- Raised match_threshold to 0.42 to reduce false matches
+v13 FIX:
+- REMOVED confidence gap requirement — template matching on wheel icons
+  inherently produces close scores (e.g. 52% vs 51%). The gap check was
+  rejecting ALL detections. Now trusts the best match above threshold.
+- Lowered threshold back to 0.38 for better sensitivity
+- Kept: time-based state reset, different-food detection, fast reset
 """
 
 import os
@@ -41,10 +38,9 @@ class IconDetector:
         self.consecutive_no_match = 0
 
         # Config
-        self.match_threshold = 0.42  # Raised from 0.35 to reduce false matches
-        self.no_match_reset_count = 1  # Reduced from 2 for faster reset
+        self.match_threshold = 0.38  # Balanced threshold for detection
+        self.no_match_reset_count = 1  # Fast reset for quick state transitions
         self.popup_timeout = 8.0  # Seconds before popup_active auto-resets
-        self.min_confidence_gap = 0.10  # Best must beat runner-up by this much
 
         # Scale range — covers popup icons (26px+) to large ones (200px+)
         self.match_scales = [
@@ -227,13 +223,9 @@ class IconDetector:
         self.last_runner_up_score = runner_up_score
 
         if best_score >= self.match_threshold:
-            # Confidence gap check: reject if runner-up is too close
-            gap = best_score - runner_up_score
-            if gap < self.min_confidence_gap and runner_up_score >= self.match_threshold:
-                # Too close — ambiguous match, don't classify
-                print(f"[GAP] Ambiguous: {best_food}={best_score:.1%} vs "
-                      f"{runner_up_food}={runner_up_score:.1%} (gap={gap:.1%} < {self.min_confidence_gap:.0%})")
-                return None, 0
+            # Trust the best match — template matching on wheel icons produces
+            # inherently close scores (e.g. 52% vs 51%), so gap checking
+            # rejects virtually everything. The best scorer is the best guess.
             return best_food, best_score
         return None, 0
 
@@ -242,7 +234,7 @@ class IconDetector:
         Main detection method — state machine approach.
         Always tries to identify. Logs once per popup appearance.
 
-        v12 improvements:
+        v13: No gap check — trusts best match above threshold.
         - Time-based popup_active reset (after popup_timeout seconds)
         - Different-food detection when popup_active
         - Faster state reset (no_match_reset_count = 1)
