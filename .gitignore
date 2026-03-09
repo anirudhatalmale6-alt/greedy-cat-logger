@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+test_output/
+*.csv
+*.xlsx
+results_history.json
+gui_screenshot.png
+templates/_extracted/
