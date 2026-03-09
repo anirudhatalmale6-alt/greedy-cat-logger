@@ -1,9 +1,12 @@
 """
-Statistics GUI for Greedy Cat Result Logger v7
+Statistics GUI for Greedy Cat Result Logger v10
 Shows history as game icons, hot/cold items, percentages, streaks.
 Dark theme matching reference software style.
 
-New in v7: One-click calibration for reliable popup detection.
+v10: Capture verification dialog — tests if screen capture works before
+     monitoring starts. Auto-switches to pyautogui fallback if mss returns
+     black images (common with DirectX/OpenGL emulators like BlueStacks).
+     Auto-saves first 20 scans for diagnostics.
 """
 
 import tkinter as tk
@@ -1040,6 +1043,170 @@ class StatsGUI:
         size_var.trace_add("write", update_crop_size)
 
     # ================================================================
+    #                      CAPTURE VERIFICATION
+    # ================================================================
+
+    def _verify_capture(self):
+        """
+        Verify that screen capture is working before starting monitoring.
+        Tests both capture methods (mss and pyautogui) and shows the result.
+        Auto-selects the working method.
+        Returns True if user confirms capture looks correct.
+        """
+        ix = self.settings.get("icon_center_x", 0)
+        iy = self.settings.get("icon_center_y", 0)
+        crop_size = self.settings.get("crop_size", 150)
+        half = crop_size // 2
+
+        x = ix - half
+        y = iy - half
+
+        self.status_label.config(text="Testing capture methods...", fg="#d29922")
+        self.root.update_idletasks()
+
+        # Test both capture methods
+        results = self.capturer.test_capture_methods(x, y, crop_size, crop_size)
+
+        mss_img, mss_valid = results["mss"]
+        pyag_img, pyag_valid = results["pyautogui"]
+
+        # Save both for diagnostics
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
+        os.makedirs(debug_dir, exist_ok=True)
+        if mss_img is not None:
+            cv2.imwrite(os.path.join(debug_dir, "verify_mss.png"), mss_img)
+        if pyag_img is not None:
+            cv2.imwrite(os.path.join(debug_dir, "verify_pyautogui.png"), pyag_img)
+
+        # Determine which method to use
+        if mss_valid:
+            self.capturer.use_fallback = False
+            method_name = "mss (fast)"
+            capture = mss_img
+            method_note = ""
+        elif pyag_valid:
+            self.capturer.use_fallback = True
+            method_name = "pyautogui (compatible)"
+            capture = pyag_img
+            method_note = ("NOTE: mss capture returned a black/invalid image.\n"
+                           "Switched to pyautogui fallback (slightly slower but works).\n"
+                           "This is normal for DirectX/OpenGL emulators like BlueStacks.")
+        else:
+            # Neither works
+            messagebox.showerror("Capture Failed",
+                "BOTH capture methods returned black or invalid images!\n\n"
+                "The program CANNOT see the game screen at the calibrated position.\n\n"
+                "Possible fixes:\n"
+                "1. Make sure the game window is NOT minimized\n"
+                "2. Make sure the result popup is visible on screen\n"
+                "3. Try disabling hardware acceleration in BlueStacks:\n"
+                "   Settings > Graphics > GPU Mode > Software\n"
+                "4. Re-calibrate if the game window was moved or resized\n\n"
+                f"Diagnostic images saved to:\n{debug_dir}")
+            self.status_label.config(text="Capture verification FAILED", fg=self.RED)
+            return False
+
+        # --- Show verification dialog with the captured image ---
+        verify_win = tk.Toplevel(self.root)
+        verify_win.title("Capture Verification")
+        verify_win.configure(bg="#0d1117")
+        verify_win.transient(self.root)
+        verify_win.grab_set()
+        verify_win.attributes('-topmost', True)
+
+        # Title
+        tk.Label(verify_win,
+                 text="CAPTURE VERIFICATION",
+                 font=("Segoe UI", 14, "bold"), fg="#FFD700", bg="#0d1117"
+        ).pack(pady=(10, 5))
+
+        tk.Label(verify_win,
+                 text=f"Capture method: {method_name}",
+                 font=("Segoe UI", 10, "bold"), fg="#3fb950", bg="#0d1117"
+        ).pack()
+
+        if method_note:
+            tk.Label(verify_win,
+                     text=method_note,
+                     font=("Segoe UI", 9), fg="#d29922", bg="#0d1117",
+                     wraplength=500, justify="left"
+            ).pack(padx=15, pady=3)
+
+        tk.Label(verify_win,
+                 text="This is what the program sees at the calibrated position:",
+                 font=("Segoe UI", 10), fg="#8b949e", bg="#0d1117"
+        ).pack(pady=(5, 8))
+
+        # Show the captured crop (scaled up for visibility)
+        display_size = 300
+        rgb = cv2.cvtColor(capture, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        pil_img = pil_img.resize((display_size, display_size), Image.NEAREST)
+        tk_img = ImageTk.PhotoImage(pil_img)
+
+        img_label = tk.Label(verify_win, image=tk_img, bg="#000000",
+                             relief="solid", borderwidth=2)
+        img_label.pack(padx=20, pady=5)
+        img_label._img_ref = tk_img
+
+        # Try detection on this capture
+        if self.detector and self.detector.is_ready:
+            food, conf = self.detector.identify_icon(capture)
+            if food:
+                d = FOOD_DISPLAY.get(food, {})
+                detect_text = f"Detected: {d.get('name', food)} ({conf:.0%})"
+                detect_color = "#3fb950"
+            else:
+                best = self.detector.last_best_food
+                score = self.detector.last_best_score
+                if best:
+                    detect_text = f"No match yet (best: {best} at {score:.0%}, threshold: 35%)"
+                else:
+                    detect_text = "No match — popup may not be visible right now (that's OK)"
+                detect_color = "#d29922"
+
+            tk.Label(verify_win, text=detect_text,
+                     font=("Segoe UI", 11, "bold"), fg=detect_color, bg="#0d1117"
+            ).pack(pady=5)
+
+        tk.Label(verify_win,
+                 text="If the image shows the game area (not a black rectangle),\n"
+                      "click 'Start Monitoring' to begin automatic detection.\n\n"
+                      "A popup does NOT need to be visible right now — the program\n"
+                      "will wait and detect popups as they appear.",
+                 font=("Segoe UI", 9), fg="#8b949e", bg="#0d1117",
+                 justify="center"
+        ).pack(pady=5)
+
+        result = {"confirmed": False}
+
+        def on_start():
+            result["confirmed"] = True
+            verify_win.destroy()
+
+        def on_cancel():
+            verify_win.destroy()
+
+        btn_frame = tk.Frame(verify_win, bg="#0d1117")
+        btn_frame.pack(pady=10)
+
+        tk.Button(btn_frame, text="Start Monitoring",
+                  font=("Segoe UI", 11, "bold"),
+                  bg="#238636", fg="white", relief="flat", padx=20, pady=6,
+                  command=on_start, cursor="hand2"
+        ).pack(side="left", padx=5)
+
+        tk.Button(btn_frame, text="Cancel",
+                  font=("Segoe UI", 10),
+                  bg="#da3633", fg="white", relief="flat", padx=14, pady=6,
+                  command=on_cancel, cursor="hand2"
+        ).pack(side="left", padx=5)
+
+        # Wait for dialog
+        verify_win.wait_window()
+        return result["confirmed"]
+
+    # ================================================================
     #                      MONITORING
     # ================================================================
 
@@ -1066,6 +1233,11 @@ class StatsGUI:
             if self.detector and not self.detector.is_ready:
                 messagebox.showwarning("No Templates",
                     "No icon templates loaded!\nAdd images to the 'templates/' folder.")
+                return
+
+            # Verify capture works before starting
+            if not self._verify_capture():
+                self.status_label.config(text="Monitoring cancelled", fg=self.TEXT_DIM)
                 return
 
             # Apply settings to detector
@@ -1122,6 +1294,12 @@ class StatsGUI:
             return
 
         self.scan_count += 1
+
+        # Auto-save first 20 scans for diagnostics (always, no checkbox needed)
+        if self.scan_count <= 20:
+            debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
+            os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(debug_dir, f"auto_scan_{self.scan_count:03d}.png"), crop)
 
         # Save crop for preview (thread-safe: just save reference)
         self.latest_crop = crop.copy()
@@ -1206,8 +1384,8 @@ class StatsGUI:
 
     def _test_capture(self):
         """
-        Capture the calibrated crop region and try to detect the food icon.
-        Shows the result and saves the capture for debugging.
+        Test BOTH capture methods on the calibrated region.
+        Shows detailed diagnostics about what each method captures.
         """
         if not self.capturer:
             messagebox.showwarning("No Capturer", "Screen capture not available.")
@@ -1222,45 +1400,52 @@ class StatsGUI:
                 "Please calibrate first by clicking the 'Calibrate' button.")
             return
 
-        # Capture the crop
         half = crop_size // 2
-        img = self.capturer.capture_region(
-            ix - half, iy - half, crop_size, crop_size)
+        x, y = ix - half, iy - half
 
-        if img is None:
-            messagebox.showerror("Capture Failed", "Could not capture the calibrated region.")
-            return
+        # Test both methods
+        results = self.capturer.test_capture_methods(x, y, crop_size, crop_size)
 
-        # Save the capture
         debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
         os.makedirs(debug_dir, exist_ok=True)
-        capture_path = os.path.join(debug_dir, "test_capture.png")
-        cv2.imwrite(capture_path, img)
 
-        # Try to detect
-        result_msg = f"Captured crop: {img.shape[1]}x{img.shape[0]} pixels\n"
-        result_msg += f"Position: centered at ({ix}, {iy})\n"
-        result_msg += f"Saved to: {capture_path}\n\n"
+        result_msg = f"Capture position: centered at ({ix}, {iy}), crop {crop_size}x{crop_size}\n\n"
 
-        if self.detector and self.detector.is_ready:
-            food, confidence = self.detector.identify_icon(img)
-            if food:
-                d = FOOD_DISPLAY.get(food, {})
-                result_msg += f"DETECTED: {d.get('name', food)} {d.get('emoji', '')}\n"
-                result_msg += f"Confidence: {confidence:.1%}\n"
-                self.status_label.config(
-                    text=f"Test: {d.get('name', food)} ({confidence:.0%})")
+        for method_name, (img, valid) in results.items():
+            status = "VALID" if valid else "INVALID (black/uniform)"
+            result_msg += f"--- {method_name} ---\n"
+            result_msg += f"  Status: {status}\n"
+
+            if img is not None:
+                path = os.path.join(debug_dir, f"test_{method_name}.png")
+                cv2.imwrite(path, img)
+                result_msg += f"  Size: {img.shape[1]}x{img.shape[0]}\n"
+
+                import numpy as np
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                result_msg += f"  Mean brightness: {np.mean(gray):.1f}\n"
+                result_msg += f"  Std deviation: {np.std(gray):.1f}\n"
+
+                if valid and self.detector and self.detector.is_ready:
+                    food, conf = self.detector.identify_icon(img)
+                    if food:
+                        d = FOOD_DISPLAY.get(food, {})
+                        result_msg += f"  Detection: {d.get('name', food)} ({conf:.1%})\n"
+                    else:
+                        result_msg += f"  Detection: no match\n"
+
+                result_msg += f"  Saved to: {path}\n"
             else:
-                result_msg += "NO MATCH FOUND\n\n"
-                result_msg += "Tips:\n"
-                result_msg += "- Make sure the result popup is visible on screen\n"
-                result_msg += "- Re-calibrate if the game window moved\n"
-                result_msg += "- Try adjusting the crop size (default 150px)"
-                self.status_label.config(text="Test: No match found")
-        else:
-            result_msg += "Detector not ready (no templates loaded)"
+                result_msg += f"  Capture returned None (error)\n"
+            result_msg += "\n"
 
-        messagebox.showinfo("Test Capture Result", result_msg)
+        # Current method
+        current = "pyautogui (fallback)" if self.capturer.use_fallback else "mss (default)"
+        result_msg += f"Current method: {current}\n"
+        result_msg += f"\nCheck the debug_captures/ folder for saved images."
+
+        messagebox.showinfo("Capture Test Results", result_msg)
+        self.status_label.config(text="Test complete — check results")
 
     def _clear_all(self):
         if not self.logger.results:
