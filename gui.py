@@ -204,6 +204,13 @@ class StatsGUI:
         ).pack(side="left", padx=3)
 
         tk.Button(
+            ctrl, text="Test Capture", font=("Segoe UI", 9),
+            bg="#8957e5", fg="white", relief="flat", padx=10, pady=5,
+            command=self._test_capture, cursor="hand2",
+            activebackground="#a371f7"
+        ).pack(side="left", padx=3)
+
+        tk.Button(
             ctrl, text="Clear All", font=("Segoe UI", 9),
             bg="#da3633", fg="white", relief="flat", padx=10, pady=5,
             command=self._clear_all, cursor="hand2",
@@ -741,17 +748,17 @@ class StatsGUI:
         # Compute perceptual hash of current frame for change detection
         current_hash = self.detector.compute_image_hash(img)
 
-        # Check if the screen changed significantly from last scan
+        # Check if the screen changed from last scan
         if self.previous_strip_hash:
             dist = self.detector.hash_distance(current_hash, self.previous_strip_hash)
-            if dist < 15:
-                # Screen hasn't changed enough — skip (same popup or no popup)
+            if dist < 8:
+                # Screen hasn't changed — skip (same frame)
                 return
 
         # Try to find a food icon in the popup area using multi-scale matching
         food_name, confidence, x, y = self.detector.find_best_match_in_region(img)
 
-        if food_name and confidence >= 0.70:
+        if food_name and confidence >= 0.25:
             # Check we're not logging the same result as last time
             last = self.logger.results[-1]["result"] if self.logger.results else None
             last_time = self.logger.results[-1]["time"] if self.logger.results else ""
@@ -910,6 +917,63 @@ class StatsGUI:
         self._refresh_stats()
         d = FOOD_DISPLAY[food]
         self.status_label.config(text=f"Added: {d['name']}")
+
+    def _test_capture(self):
+        """
+        Capture the current region and try to detect a food icon.
+        Shows the result and saves the capture for debugging.
+        """
+        if not self.capturer:
+            messagebox.showwarning("No Capturer", "Screen capture not available.")
+            return
+
+        if self.capturer.result_region is None:
+            s = self.settings
+            if s["region_w"] > 0 and s["region_h"] > 0:
+                self.capturer.set_result_region(
+                    s["region_x"], s["region_y"], s["region_w"], s["region_h"])
+            else:
+                messagebox.showwarning("No Region",
+                    "Please set the capture region first.\n"
+                    "Click 'Set Region' to configure.")
+                return
+
+        img = self.capturer.capture_result_strip()
+        if img is None:
+            messagebox.showerror("Capture Failed", "Could not capture screen region.")
+            return
+
+        # Save the capture
+        debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_captures")
+        os.makedirs(debug_dir, exist_ok=True)
+        import cv2
+        capture_path = os.path.join(debug_dir, "test_capture.png")
+        cv2.imwrite(capture_path, img)
+
+        # Try to detect
+        result_msg = f"Captured region: {img.shape[1]}x{img.shape[0]} pixels\n"
+        result_msg += f"Saved to: {capture_path}\n\n"
+
+        if self.detector and self.detector.is_ready:
+            food, confidence, x, y = self.detector.find_best_match_in_region(img)
+            if food:
+                d = FOOD_DISPLAY.get(food, {})
+                result_msg += f"DETECTED: {d.get('name', food)} {d.get('emoji', '')}\n"
+                result_msg += f"Confidence: {confidence:.1%}\n"
+                result_msg += f"Position: ({x}, {y})"
+                self.status_label.config(
+                    text=f"Test: {d.get('name', food)} ({confidence:.0%})")
+            else:
+                result_msg += "NO MATCH FOUND\n\n"
+                result_msg += "Tips:\n"
+                result_msg += "- Make sure the popup result is visible on screen\n"
+                result_msg += "- Adjust the capture region to cover the popup area\n"
+                result_msg += "- The region should show the food icon"
+                self.status_label.config(text="Test: No match found")
+        else:
+            result_msg += "Detector not ready (no templates loaded)"
+
+        messagebox.showinfo("Test Capture Result", result_msg)
 
     def _clear_all(self):
         if not self.logger.results:
