@@ -73,7 +73,8 @@ class StatsGUI:
         defaults = {
             "region_x": 0, "region_y": 0, "region_w": 0, "region_h": 0,
             "icon_center_x": 0, "icon_center_y": 0, "crop_size": 150,
-            "interval": 1.5,
+            "interval": 1.0,
+            "debug_saves": False,
         }
         if os.path.exists(self.config_path):
             try:
@@ -231,6 +232,16 @@ class StatsGUI:
             command=self._export_excel, cursor="hand2",
             activebackground="#bb8009"
         ).pack(side="right", padx=3)
+
+        # Debug toggle
+        self.debug_var = tk.BooleanVar(value=self.settings.get("debug_saves", False))
+        self.debug_cb = tk.Checkbutton(
+            ctrl, text="Save captures", font=("Segoe UI", 8),
+            variable=self.debug_var, fg=self.TEXT_DIM, bg=self.BG_COLOR,
+            selectcolor=self.CARD_BG, activebackground=self.BG_COLOR,
+            command=self._toggle_debug
+        )
+        self.debug_cb.pack(side="right", padx=3)
 
     # ===================== CALIBRATION STATUS =====================
     def _build_calibration_info(self):
@@ -555,6 +566,13 @@ class StatsGUI:
             fg=self.TEXT_DIM, bg="#010409"
         )
         self.scan_label.pack(side="right", padx=8)
+
+        # Diagnostic line — shows what the detector sees each scan
+        self.diag_label = tk.Label(
+            status, text="", font=("Consolas", 7),
+            fg="#484f58", bg="#010409"
+        )
+        self.diag_label.pack(side="right", padx=8)
 
     # ================================================================
     #                      UPDATE / REFRESH
@@ -957,6 +975,12 @@ class StatsGUI:
                     "No icon templates loaded!\nAdd images to the 'templates/' folder.")
                 return
 
+            # Apply debug setting to detector
+            if self.detector:
+                self.detector.debug_enabled = self.settings.get("debug_saves", False)
+                self.detector.popup_active = False
+                self.detector.consecutive_no_match = 0
+
             self.monitoring = True
             self.btn_monitor.config(text=" STOP MONITORING", bg="#da3633")
             self.status_label.config(
@@ -977,8 +1001,7 @@ class StatsGUI:
     def _scan_once(self):
         """
         Capture the small calibrated crop and detect the food icon.
-        Uses frame differencing to detect popup changes, then template
-        matching to identify the food.
+        State-machine approach: always tries to identify, logs once per popup.
         """
         if not self.capturer or not self.detector:
             return
@@ -996,12 +1019,17 @@ class StatsGUI:
             ix - half, iy - half, crop_size, crop_size)
 
         if crop is None:
+            self.root.after(0, lambda: self.diag_label.config(text="Capture failed"))
             return
 
         self.scan_count += 1
 
-        # Use the focused scan method
+        # Run detection (state machine handles logging logic)
         food_name, confidence = self.detector.scan_crop(crop)
+
+        # Update diagnostic display
+        diag_text = self.detector.last_scan_info
+        self.root.after(0, lambda t=diag_text: self.diag_label.config(text=t))
 
         if food_name:
             self.logger.add_result(food_name, confidence=confidence)
@@ -1011,6 +1039,16 @@ class StatsGUI:
                 text=f"Round {self.logger.total_rounds}: "
                      f"{FOOD_DISPLAY.get(fn, {}).get('name', fn)} ({c:.0%})",
                 fg=self.GREEN))
+
+    def _toggle_debug(self):
+        """Toggle debug capture saving."""
+        enabled = self.debug_var.get()
+        self.settings["debug_saves"] = enabled
+        self._save_settings()
+        if self.detector:
+            self.detector.debug_enabled = enabled
+        self.status_label.config(
+            text=f"Debug saves: {'ON' if enabled else 'OFF'}")
 
     # ================================================================
     #                      OTHER ACTIONS

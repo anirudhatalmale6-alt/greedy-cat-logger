@@ -20,6 +20,18 @@ import argparse
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Windows DPI awareness — ensures screen coordinates match between
+# Tkinter (calibration clicks) and mss (screen captures)
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
 from logger import ResultLogger
 from detector import IconDetector
 from capture import ScreenCapture
