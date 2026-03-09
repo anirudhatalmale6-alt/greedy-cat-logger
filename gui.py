@@ -67,7 +67,7 @@ class StatsGUI:
 
     def _load_settings(self):
         """Load saved settings."""
-        defaults = {"region_x": 0, "region_y": 0, "region_w": 450, "region_h": 50, "interval": 2.0}
+        defaults = {"region_x": 0, "region_y": 0, "region_w": 0, "region_h": 0, "interval": 1.5}
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, 'r') as f:
@@ -695,10 +695,16 @@ class StatsGUI:
                     "No icon templates loaded!\nAdd images to the 'templates/' folder.")
                 return
             if self.capturer and self.capturer.result_region is None:
-                # Apply saved region
                 s = self.settings
-                self.capturer.set_result_region(
-                    s["region_x"], s["region_y"], s["region_w"], s["region_h"])
+                if s["region_w"] > 0 and s["region_h"] > 0:
+                    self.capturer.set_result_region(
+                        s["region_x"], s["region_y"], s["region_w"], s["region_h"])
+                else:
+                    messagebox.showwarning("No Region Set",
+                        "Please set the popup capture region first.\n"
+                        "Click 'Set Region' → 'Find Emulator' to auto-detect,\n"
+                        "or enter the popup area coordinates manually.")
+                    return
 
             self.monitoring = True
             self.btn_monitor.config(text=" STOP MONITORING", bg="#da3633")
@@ -717,6 +723,12 @@ class StatsGUI:
         self.monitor_thread.start()
 
     def _scan_once(self):
+        """
+        Scan the popup area for a result icon.
+        The game shows a popup with the winning food icon after each round.
+        We detect when a new popup appears, identify the icon, log it,
+        then wait for the popup to disappear before scanning again.
+        """
         if not self.capturer or not self.detector:
             return
 
@@ -726,37 +738,46 @@ class StatsGUI:
 
         self.scan_count += 1
 
-        # Detect all icons in the result strip
-        results = self.detector.detect_result_row(img)
-        if not results:
-            return
+        # Compute perceptual hash of current frame for change detection
+        current_hash = self.detector.compute_image_hash(img)
 
-        # Create a hash of current results to detect changes
-        current_hash = "|".join(results)
-        if current_hash == self.previous_strip_hash:
-            return  # No change
-
-        # Find new results (compare with previous)
+        # Check if the screen changed significantly from last scan
         if self.previous_strip_hash:
-            prev_list = self.previous_strip_hash.split("|")
-            # New items appear at the end (right side)
-            if len(results) > len(prev_list):
-                new_items = results[len(prev_list):]
-            elif results != prev_list:
-                # Results shifted: new one at end, oldest dropped
-                new_items = [results[-1]]
-            else:
-                new_items = []
-        else:
-            # First scan — only take the last result to avoid logging old history
-            new_items = [results[-1]] if results else []
+            dist = self.detector.hash_distance(current_hash, self.previous_strip_hash)
+            if dist < 15:
+                # Screen hasn't changed enough — skip (same popup or no popup)
+                return
 
+        # Try to find a food icon in the popup area using multi-scale matching
+        food_name, confidence, x, y = self.detector.find_best_match_in_region(img)
+
+        if food_name and confidence >= 0.70:
+            # Check we're not logging the same result as last time
+            last = self.logger.results[-1]["result"] if self.logger.results else None
+            last_time = self.logger.results[-1]["time"] if self.logger.results else ""
+
+            # Avoid duplicate: same food within last 5 seconds
+            import datetime as dt
+            is_duplicate = False
+            if last == food_name and last_time:
+                try:
+                    last_dt = dt.datetime.strptime(last_time, "%Y-%m-%d %H:%M:%S")
+                    now = dt.datetime.now()
+                    if (now - last_dt).total_seconds() < 5:
+                        is_duplicate = True
+                except Exception:
+                    pass
+
+            if not is_duplicate:
+                self.logger.add_result(food_name, confidence=confidence)
+                self.root.after(0, self._refresh_stats)
+                # Update status on main thread
+                d = FOOD_DISPLAY.get(food_name, {})
+                self.root.after(0, lambda: self.status_label.config(
+                    text=f"Detected: {d.get('name', food_name)} ({confidence:.0%})"))
+
+        # Always update hash so we can detect the next change
         self.previous_strip_hash = current_hash
-
-        for food in new_items:
-            self.logger.add_result(food, confidence=0.9)
-
-        self.root.after(0, self._refresh_stats)
 
     def _set_region(self):
         dialog = tk.Toplevel(self.root)
@@ -766,13 +787,13 @@ class StatsGUI:
         dialog.transient(self.root)
         dialog.grab_set()
 
-        tk.Label(dialog, text="Capture Region (Result Row)",
+        tk.Label(dialog, text="Capture Region (Popup Area)",
                  font=("Segoe UI", 12, "bold"), fg=self.TEXT_COLOR,
                  bg=self.BG_COLOR).pack(pady=10)
 
         tk.Label(dialog,
-                 text="Enter the pixel coordinates of the\nResult row in the Xena/emulator window.\n\n"
-                      "Use a screenshot tool to measure\nX, Y, Width, Height of the result area.",
+                 text="Set the region where the result popup\nappears in the Greedy Cat game.\n\n"
+                      "This should cover the popup area where\nthe winning food icon is shown after each round.",
                  font=("Segoe UI", 9), fg=self.TEXT_DIM,
                  bg=self.BG_COLOR, justify="center").pack(pady=5)
 
@@ -817,22 +838,25 @@ class StatsGUI:
             if self.capturer:
                 win = self.capturer.find_emulator_window()
                 if win:
-                    # Auto-fill with bottom strip of emulator window
-                    # Result row is typically at the very bottom ~5% of the game
-                    emu_bottom_y = win["top"] + int(win["height"] * 0.92)
+                    # Auto-fill with the center area of the emulator where
+                    # the popup result icon appears (roughly center 40% of window)
+                    popup_x = win["left"] + int(win["width"] * 0.20)
+                    popup_y = win["top"] + int(win["height"] * 0.25)
+                    popup_w = int(win["width"] * 0.55)
+                    popup_h = int(win["height"] * 0.50)
                     entries["region_x"].delete(0, "end")
-                    entries["region_x"].insert(0, str(win["left"] + 10))
+                    entries["region_x"].insert(0, str(popup_x))
                     entries["region_y"].delete(0, "end")
-                    entries["region_y"].insert(0, str(emu_bottom_y))
+                    entries["region_y"].insert(0, str(popup_y))
                     entries["region_w"].delete(0, "end")
-                    entries["region_w"].insert(0, str(int(win["width"] * 0.6)))
+                    entries["region_w"].insert(0, str(popup_w))
                     entries["region_h"].delete(0, "end")
-                    entries["region_h"].insert(0, str(int(win["height"] * 0.06)))
+                    entries["region_h"].insert(0, str(popup_h))
                     messagebox.showinfo("Found",
                         f"Found: {win['title']}\n"
                         f"Position: ({win['left']}, {win['top']})\n"
                         f"Size: {win['width']}x{win['height']}\n\n"
-                        "Auto-filled approximate Result row region.\n"
+                        "Auto-filled popup detection region.\n"
                         "Adjust if needed, then click Apply.")
                 else:
                     messagebox.showwarning("Not Found",
