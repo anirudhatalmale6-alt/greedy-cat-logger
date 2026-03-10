@@ -1,21 +1,23 @@
 """
-Icon detection engine for Greedy Cat Result Logger v14.
+Icon detection engine for Greedy Cat Result Logger v16.
 
-APPROACH: Stability-based detection to prevent false triggers during wheel spin.
+v16 — COLOR-BASED IDENTIFICATION (fixes misclassification)
 
-v14 — CRITICAL FIX: Spinning wheel false detection
-The wheel shows food icons rotating rapidly. The detector was matching these
-spinning icons and logging them as results. The fix uses TWO stability checks:
+ROOT CAUSE of v14/v15 bugs: Template matching was done on GRAYSCALE images,
+so all color information was lost. At small scales (0.3x = 26px), all food
+icons look structurally similar in grayscale, and corn's pattern happened
+to win by default. Tomato (red) was detected as Corn (yellow) because the
+detector literally couldn't see color.
 
-1. CONSECUTIVE MATCH: The same food must be detected in 3+ consecutive scans
-   before it's logged. During spinning, different foods appear each scan.
-   During the popup, the same food stays stable for many seconds.
+FIX: HSV color histogram matching for food IDENTIFICATION.
+- Template matching = "is there a food icon present?" (gatekeeper)
+- Color histogram = "WHICH food is it?" (identifier)
 
-2. IMAGE STABILITY: The captured crop must be visually stable (low pixel
-   difference between consecutive frames). During spinning, pixels change
-   dramatically. During the popup, the image barely changes.
+This also fixes the HOT label issue: HOT badges overlay a small portion
+of the icon, but the dominant color distribution remains recognizable.
+Red tomato stays mostly red even with a HOT badge.
 
-Both conditions must be met before a result is logged.
+Stability checks from v14 are preserved (consecutive match + image stability).
 """
 
 import os
@@ -26,12 +28,13 @@ from config import FOOD_ITEMS, TEMPLATES_DIR
 
 
 class IconDetector:
-    """Detects food icons using stability-verified template matching."""
+    """Detects food icons using color histogram identification."""
 
     def __init__(self, templates_dir=None):
         self.templates_dir = templates_dir or TEMPLATES_DIR
         self.templates = {}       # {food_name: BGR image}
         self.gray_templates = {}  # {food_name: grayscale image}
+        self.color_profiles = {}  # {food_name: normalized HS histogram}
 
         # Learned references from manual adds (actual popup crops)
         self.references = {}  # {food_name: [gray_image, ...]}
@@ -45,22 +48,23 @@ class IconDetector:
         self.consecutive_no_match = 0
 
         # Config
-        self.match_threshold = 0.38  # Template matching threshold
-        self.no_match_reset_count = 1  # Scans with no match to reset popup state
-        self.popup_timeout = 10.0  # Seconds before popup_active auto-resets
+        self.match_threshold = 0.35  # Template matching threshold (gatekeeper only)
+        self.color_threshold = 0.15  # Min color histogram correlation
+        self.no_match_reset_count = 1
+        self.popup_timeout = 10.0
 
-        # STABILITY CONFIG (v14) — prevents detecting spinning wheel
-        self.required_consecutive = 3  # Same food must match N times in a row
-        self.image_stability_threshold = 8.0  # Max mean pixel diff for "stable"
-        self.required_stable_frames = 2  # Image must be stable for N frames
+        # STABILITY CONFIG (v14)
+        self.required_consecutive = 3
+        self.image_stability_threshold = 8.0
+        self.required_stable_frames = 2
 
         # Stability tracking
-        self.consecutive_food = None  # Current food being tracked
-        self.consecutive_count = 0  # How many times in a row
-        self.prev_gray_crop = None  # Previous frame for stability check
-        self.stable_frame_count = 0  # How many frames the image has been stable
+        self.consecutive_food = None
+        self.consecutive_count = 0
+        self.prev_gray_crop = None
+        self.stable_frame_count = 0
 
-        # Scale range
+        # Scale range for template matching (gatekeeper)
         self.match_scales = [
             0.3, 0.4, 0.5, 0.6, 0.75,
             1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0
@@ -73,7 +77,11 @@ class IconDetector:
         self.last_best_scale = 0
         self.last_runner_up_food = None
         self.last_runner_up_score = 0
-        self.last_image_diff = 0  # Pixel difference from previous frame
+        self.last_color_food = None
+        self.last_color_score = 0
+        self.last_color_runner_up = None
+        self.last_color_runner_score = 0
+        self.last_image_diff = 0
         self.total_scans = 0
         self.total_detections = 0
 
@@ -85,6 +93,7 @@ class IconDetector:
 
         self.load_templates()
         self.load_references()
+        self._build_color_profiles()
 
     def load_templates(self):
         """Load template images from the templates directory."""
@@ -104,6 +113,53 @@ class IconDetector:
                         self.templates[food] = img
                         self.gray_templates[food] = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                     break
+
+    def _build_color_profiles(self):
+        """
+        Build 2D Hue-Saturation color profiles for each food template.
+
+        Uses alpha channel (if present) to mask out transparent background.
+        Only includes pixels with meaningful color (S > 30, V > 30).
+        These profiles are compared against popup crops to identify food.
+        """
+        self.color_profiles = {}
+
+        for food in FOOD_ITEMS:
+            for ext in ('.png', '.jpg', '.jpeg', '.bmp'):
+                path = os.path.join(self.templates_dir, food + ext)
+                if not os.path.exists(path):
+                    continue
+
+                # Load WITH alpha channel for proper transparency masking
+                img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    continue
+
+                if img.shape[2] == 4:
+                    # Use alpha channel as mask
+                    alpha = img[:, :, 3]
+                    bgr = img[:, :, :3]
+                    mask = np.zeros(alpha.shape, np.uint8)
+                    mask[alpha > 128] = 255
+                else:
+                    bgr = img
+                    mask = np.ones(img.shape[:2], np.uint8) * 255
+
+                hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+                # Exclude low-saturation (grays) and very dark pixels
+                mask[hsv[:, :, 1] < 30] = 0
+                mask[hsv[:, :, 2] < 30] = 0
+
+                # 2D Hue-Saturation histogram (30 hue bins x 16 sat bins)
+                hist = cv2.calcHist([hsv], [0, 1], mask,
+                                    [30, 16], [0, 180, 0, 256])
+                cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+                self.color_profiles[food] = hist
+                break
+
+        print(f"[COLOR] Built color profiles for {len(self.color_profiles)} foods: "
+              f"{list(self.color_profiles.keys())}")
 
     def load_references(self):
         """Load learned reference crops from manual adds."""
@@ -152,13 +208,11 @@ class IconDetector:
             self.stable_frame_count = 0
             return False, 0.0
 
-        # Ensure same shape
         if self.prev_gray_crop.shape != gray_crop.shape:
             self.prev_gray_crop = gray_crop.copy()
             self.stable_frame_count = 0
             return False, 0.0
 
-        # Calculate mean absolute pixel difference
         diff = cv2.absdiff(gray_crop, self.prev_gray_crop)
         mean_diff = float(np.mean(diff))
 
@@ -173,23 +227,93 @@ class IconDetector:
         is_stable = self.stable_frame_count >= self.required_stable_frames
         return is_stable, mean_diff
 
-    def identify_icon(self, crop_image):
+    def _identify_by_color(self, crop_bgr):
         """
-        Identify which food icon is in a cropped image.
-        Returns: (food_name, confidence) or (None, 0)
+        Identify food by HSV color histogram comparison.
+
+        Extracts the CENTER region of the crop (where the food icon is),
+        builds a 2D Hue-Saturation histogram, and compares against all
+        food color profiles.
+
+        Returns: (food_name, correlation_score) or (None, 0)
         """
-        if crop_image is None or crop_image.size == 0:
+        if not self.color_profiles:
             return None, 0
 
-        if not self.gray_templates and not self.references:
+        h, w = crop_bgr.shape[:2]
+
+        # Extract center 60% of crop (food icon area)
+        # The outer 20% on each side is popup background/border
+        cs = int(min(h, w) * 0.3)
+        ch, cw = h // 2, w // 2
+        center = crop_bgr[max(0, ch - cs):ch + cs, max(0, cw - cs):cw + cs]
+
+        if center.size == 0 or center.shape[0] < 10 or center.shape[1] < 10:
             return None, 0
+
+        hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+
+        # Mask: exclude dark pixels (background) and desaturated (text/UI)
+        mask = np.ones(hsv.shape[:2], np.uint8) * 255
+        mask[hsv[:, :, 1] < 30] = 0
+        mask[hsv[:, :, 2] < 30] = 0
+
+        # Check we have enough colored pixels
+        colored_pixels = np.sum(mask > 0)
+        if colored_pixels < 50:
+            return None, 0
+
+        # Build 2D HS histogram matching the profile format
+        hist = cv2.calcHist([hsv], [0, 1], mask,
+                            [30, 16], [0, 180, 0, 256])
+        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+
+        # Compare with each food's color profile
+        scores = {}
+        for food, profile in self.color_profiles.items():
+            corr = cv2.compareHist(hist, profile, cv2.HISTCMP_CORREL)
+            scores[food] = corr
+
+        if not scores:
+            return None, 0
+
+        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
+        best_food = sorted_scores[0][0]
+        best_score = sorted_scores[0][1]
+
+        # Update diagnostics
+        self.last_color_food = best_food
+        self.last_color_score = best_score
+        if len(sorted_scores) > 1:
+            self.last_color_runner_up = sorted_scores[1][0]
+            self.last_color_runner_score = sorted_scores[1][1]
+        else:
+            self.last_color_runner_up = None
+            self.last_color_runner_score = 0
+
+        return best_food, best_score
+
+    def _template_gate(self, crop_image):
+        """
+        Template matching as GATEKEEPER only — detects if any food icon is present.
+        Does NOT determine which food (color does that).
+
+        Returns: (best_food, best_score, best_scale) or (None, 0, 0)
+        """
+        if crop_image is None or crop_image.size == 0:
+            return None, 0, 0
+
+        if not self.gray_templates and not self.references:
+            return None, 0, 0
 
         gray = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
         ch, cw = gray.shape[:2]
 
-        food_scores = {}
+        best_score = 0
+        best_food = None
+        best_scale = 0
 
-        # Match against static templates
+        # Match against all templates — find highest score regardless of food
         for food, tmpl in self.gray_templates.items():
             th, tw = tmpl.shape[:2]
 
@@ -205,12 +329,14 @@ class IconDetector:
                     result = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, _ = cv2.minMaxLoc(result)
 
-                    if food not in food_scores or max_val > food_scores[food][0]:
-                        food_scores[food] = (max_val, scale)
+                    if max_val > best_score:
+                        best_score = max_val
+                        best_food = food
+                        best_scale = scale
                 except Exception:
                     continue
 
-        # Match against learned references
+        # Also check learned references
         for food, ref_list in self.references.items():
             for ref_gray in ref_list:
                 rh, rw = ref_gray.shape[:2]
@@ -228,40 +354,59 @@ class IconDetector:
                         _, max_val, _, _ = cv2.minMaxLoc(result)
 
                         boosted = max_val * 1.1
-                        if food not in food_scores or boosted > food_scores[food][0]:
-                            food_scores[food] = (boosted, scale)
+                        if boosted > best_score:
+                            best_score = boosted
+                            best_food = food
+                            best_scale = scale
                     except Exception:
                         continue
 
-        if not food_scores:
-            self.last_best_food = None
-            self.last_best_score = 0
-            self.last_best_scale = 0
+        # Update diagnostics (template match info)
+        self.last_best_food = best_food
+        self.last_best_score = best_score
+        self.last_best_scale = best_scale
+
+        if best_score >= self.match_threshold:
+            return best_food, best_score, best_scale
+        return None, 0, 0
+
+    def identify_icon(self, crop_image):
+        """
+        v16: Combined template + color identification.
+
+        1. Template matching confirms a food icon is present (gatekeeper).
+        2. Color histogram determines WHICH food it is (identifier).
+
+        Template matching is grayscale-only and unreliable for food ID
+        at small scales. Color histograms are scale-invariant and robust
+        to HOT labels.
+        """
+        if crop_image is None or crop_image.size == 0:
+            return None, 0
+
+        # Step 1: Template matching — "is there any food icon?"
+        tmpl_food, tmpl_score, tmpl_scale = self._template_gate(crop_image)
+
+        if tmpl_food is None:
+            # No food icon detected by template matching
             self.last_runner_up_food = None
             self.last_runner_up_score = 0
             return None, 0
 
-        sorted_foods = sorted(food_scores.items(), key=lambda x: -x[1][0])
+        # Step 2: Color histogram — "WHICH food is it?"
+        color_food, color_score = self._identify_by_color(crop_image)
 
-        best_food = sorted_foods[0][0]
-        best_score = sorted_foods[0][1][0]
-        best_scale = sorted_foods[0][1][1]
+        if color_food and color_score >= self.color_threshold:
+            # Color match found — use color result with template confidence
+            self.last_runner_up_food = self.last_color_runner_up
+            self.last_runner_up_score = self.last_color_runner_score
+            return color_food, tmpl_score
 
-        runner_up_food = None
-        runner_up_score = 0
-        if len(sorted_foods) > 1:
-            runner_up_food = sorted_foods[1][0]
-            runner_up_score = sorted_foods[1][1][0]
-
-        self.last_best_food = best_food
-        self.last_best_score = best_score
-        self.last_best_scale = best_scale
-        self.last_runner_up_food = runner_up_food
-        self.last_runner_up_score = runner_up_score
-
-        if best_score >= self.match_threshold:
-            return best_food, best_score
-        return None, 0
+        # Color matching failed — fall back to template result
+        # (This shouldn't happen often since color profiles cover all foods)
+        self.last_runner_up_food = None
+        self.last_runner_up_score = 0
+        return tmpl_food, tmpl_score
 
     def scan_crop(self, crop_image):
         """
@@ -271,7 +416,8 @@ class IconDetector:
         1. Same food must match 3+ consecutive scans
         2. Image pixels must be stable (low diff) for 2+ frames
 
-        Only when BOTH conditions are met is a result logged.
+        v16: Food identification now uses color histograms instead of
+        unreliable grayscale template matching.
         """
         if crop_image is None or crop_image.size == 0:
             self.last_scan_info = "Empty crop"
@@ -280,20 +426,28 @@ class IconDetector:
         self.total_scans += 1
         now = time.time()
 
-        # Check image stability FIRST (before template matching)
+        # Check image stability FIRST
         gray_crop = cv2.cvtColor(crop_image, cv2.COLOR_BGR2GRAY)
         is_stable, pixel_diff = self._check_image_stability(gray_crop)
 
-        # Try to identify food
+        # Identify food (v16: color-based)
         food, conf = self.identify_icon(crop_image)
 
         # Build diagnostic info
-        stability_str = f"stable={self.stable_frame_count}" if is_stable else f"MOVING(diff={pixel_diff:.1f})"
+        stability_str = (f"stable={self.stable_frame_count}"
+                         if is_stable
+                         else f"MOVING(diff={pixel_diff:.1f})")
+
         if self.last_best_food:
-            best_info = (f"{self.last_best_food} {self.last_best_score:.0%} "
+            tmpl_info = (f"tmpl:{self.last_best_food} {self.last_best_score:.0%} "
                          f"@{self.last_best_scale:.2f}x")
         else:
-            best_info = "no match"
+            tmpl_info = "tmpl:none"
+
+        color_info = ""
+        if self.last_color_food:
+            color_info = (f" color:{self.last_color_food} {self.last_color_score:.2f}"
+                          f" vs {self.last_color_runner_up}:{self.last_color_runner_score:.2f}")
 
         # Auto-save scan for diagnostics
         if self.save_all_scans or self.debug_enabled:
@@ -316,13 +470,11 @@ class IconDetector:
 
             consec_str = f"x{self.consecutive_count}/{self.required_consecutive}"
 
-            # Check if we meet BOTH stability requirements
             food_stable = self.consecutive_count >= self.required_consecutive
             image_stable = is_stable
 
             if not self.popup_active:
                 if food_stable and image_stable:
-                    # CONFIRMED popup — both checks passed!
                     self.popup_active = True
                     self.last_detection_time = now
                     self.last_detected_food = food
@@ -331,30 +483,28 @@ class IconDetector:
 
                     self.last_scan_info = (
                         f"CONFIRMED: {food} ({conf:.0%}) "
-                        f"[{consec_str}, {stability_str}]")
-                    print(f"[DETECT] Confirmed: {food} (conf: {conf:.1%}, "
+                        f"[{consec_str}, {stability_str}]{color_info}")
+                    print(f"[DETECT] Confirmed: {food} (tmpl: {conf:.1%}, "
+                          f"color: {self.last_color_food}={self.last_color_score:.2f}, "
                           f"consecutive: {self.consecutive_count}, "
                           f"pixel_diff: {pixel_diff:.1f})")
                     return food, conf
 
                 elif food_stable and not image_stable:
-                    # Food matches but image still changing — spinning wheel
                     self.last_scan_info = (
                         f"WAIT-UNSTABLE: {food} ({conf:.0%}) "
-                        f"[{consec_str}, diff={pixel_diff:.1f} > {self.image_stability_threshold}]")
+                        f"[{consec_str}, diff={pixel_diff:.1f}]{color_info}")
                     self.consecutive_no_match = 0
                     return None, 0
 
                 else:
-                    # Building up consecutive count
                     self.last_scan_info = (
                         f"Building: {food} ({conf:.0%}) "
-                        f"[{consec_str}, {stability_str}]")
+                        f"[{consec_str}, {stability_str}]{color_info}")
                     self.consecutive_no_match = 0
                     return None, 0
 
             elif food != self.last_detected_food:
-                # Different food while popup active — new round?
                 if food_stable and image_stable:
                     self.last_detection_time = now
                     self.last_detected_food = food
@@ -362,16 +512,15 @@ class IconDetector:
 
                     self.last_scan_info = (
                         f"NEW FOOD: {food} ({conf:.0%}) "
-                        f"[was {self.last_detected_food}]")
+                        f"[was {self.last_detected_food}]{color_info}")
                     print(f"[DETECT] New food: {food} (was {self.last_detected_food})")
                     return food, conf
                 else:
                     self.last_scan_info = (
                         f"New? {food} ({conf:.0%}) "
-                        f"[{consec_str}, {stability_str}] not stable yet")
+                        f"[{consec_str}, {stability_str}]{color_info} not stable yet")
                     return None, 0
             else:
-                # Same food still showing
                 elapsed = now - self.last_detection_time
                 self.last_scan_info = (
                     f"Active: {food} ({conf:.0%}) "
@@ -381,9 +530,10 @@ class IconDetector:
         else:
             # No match above threshold
             self.consecutive_no_match += 1
-            # Reset consecutive tracking when no food matches
             self.consecutive_food = None
             self.consecutive_count = 0
+
+            best_info = f"{tmpl_info}{color_info}"
 
             if self.consecutive_no_match >= self.no_match_reset_count:
                 if self.popup_active:
@@ -404,12 +554,13 @@ class IconDetector:
         os.makedirs(self.debug_dir, exist_ok=True)
         self.scan_save_count += 1
 
-        best = f"{self.last_best_food}_{self.last_best_score:.0%}" if self.last_best_food else "none_0%"
+        tmpl = f"T{self.last_best_food}_{self.last_best_score:.0%}" if self.last_best_food else "Tnone"
+        color = f"C{self.last_color_food}_{self.last_color_score:.2f}" if self.last_color_food else "Cnone"
         stable = f"S{self.stable_frame_count}" if self.stable_frame_count > 0 else f"M{self.last_image_diff:.0f}"
         state = "DET" if food else "wait"
         fname = os.path.join(
             self.debug_dir,
-            f"scan_{self.scan_save_count:05d}_{state}_{best}_{stable}.png")
+            f"scan_{self.scan_save_count:05d}_{state}_{tmpl}_{color}_{stable}.png")
         cv2.imwrite(fname, image)
 
         # Keep only last 100

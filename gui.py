@@ -1,12 +1,13 @@
 """
-Statistics GUI for Greedy Cat Result Logger v15
+Statistics GUI for Greedy Cat Result Logger v16
 Shows history as game icons, hot/cold items, percentages, streaks.
 Dark theme matching reference software style.
 
-v15: POPUP PRESENCE DETECTION — the root fix for wheel false detections.
-     Before food detection, compares crop BACKGROUND to calibration baseline.
-     If background doesn't match popup appearance → skip (it's the wheel).
-     Only detects food when popup overlay is confirmed present.
+v16: COLOR-BASED FOOD IDENTIFICATION — fixes misclassification.
+     Previous versions used grayscale template matching which lost all color
+     information, causing tomato/corn confusion. v16 uses HSV color histograms
+     to identify WHICH food is present, while template matching only confirms
+     that some food icon exists. Also robust to HOT labels.
 """
 
 import tkinter as tk
@@ -82,7 +83,7 @@ class StatsGUI:
 
         # Log startup info
         self._log("="*50)
-        self._log("Greedy Cat Result Logger v15 STARTED")
+        self._log("Greedy Cat Result Logger v16 STARTED")
         self._log(f"Detector: {len(self.detector.templates) if self.detector else 0} templates loaded")
         self._log(f"Capturer: {'available' if self.capturer else 'NOT available'}")
         ix = self.settings.get("icon_center_x", 0)
@@ -350,13 +351,13 @@ class StatsGUI:
         self.preview_match_label.pack(fill="x")
 
         self.preview_score_label = tk.Label(
-            info_frame, text="Score: --  |  Scale: --  |  Threshold: 38%",
+            info_frame, text="Color: --  |  Template: --",
             font=("Consolas", 9), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
         )
         self.preview_score_label.pack(fill="x")
 
         self.preview_gap_label = tk.Label(
-            info_frame, text="Runner-up: --",
+            info_frame, text="Popup: --",
             font=("Consolas", 8), fg=self.TEXT_DIM, bg=self.CARD_BG, anchor="w"
         )
         self.preview_gap_label.pack(fill="x")
@@ -408,21 +409,36 @@ class StatsGUI:
 
         # Update match info
         if self.detector:
-            food = self.detector.last_best_food
-            score = self.detector.last_best_score
-            scale = self.detector.last_best_scale
-            threshold = self.detector.match_threshold
+            # Color match (PRIMARY identifier in v16)
+            color_food = self.detector.last_color_food
+            color_score = self.detector.last_color_score
+            color_runner = self.detector.last_color_runner_up
+            color_runner_score = self.detector.last_color_runner_score
 
-            if food:
-                d = FOOD_DISPLAY.get(food, {})
-                name = d.get("name", food)
-                color = self.GREEN if score >= threshold else "#d29922" if score >= threshold * 0.7 else self.RED
+            # Template match (gatekeeper)
+            tmpl_food = self.detector.last_best_food
+            tmpl_score = self.detector.last_best_score
+            tmpl_scale = self.detector.last_best_scale
+
+            # The identified food is determined by color (if available)
+            identified_food = color_food if color_food else tmpl_food
+
+            if identified_food:
+                d = FOOD_DISPLAY.get(identified_food, {})
+                name = d.get("name", identified_food)
+                fg_color = self.GREEN if tmpl_score >= self.detector.match_threshold else "#d29922"
                 self.preview_match_label.config(
-                    text=f"Best match: {name}", fg=color)
-                self.preview_score_label.config(
-                    text=f"Score: {score:.1%}  |  Scale: {scale:.2f}x  |  Threshold: {threshold:.0%}")
+                    text=f"Best match: {name}", fg=fg_color)
 
-                # Stability info
+                # Show both color and template scores
+                color_str = f"Color: {color_food}={color_score:.2f}" if color_food else "Color: --"
+                if color_runner:
+                    color_str += f" vs {color_runner}={color_runner_score:.2f}"
+                tmpl_str = f"Tmpl: {tmpl_food} {tmpl_score:.0%} @{tmpl_scale:.2f}x" if tmpl_food else "Tmpl: --"
+                self.preview_score_label.config(
+                    text=f"{color_str}  |  {tmpl_str}")
+
+                # Stability + popup info
                 consec = self.detector.consecutive_count
                 consec_food = self.detector.consecutive_food or "--"
                 req = self.detector.required_consecutive
@@ -1438,7 +1454,7 @@ class StatsGUI:
             self.btn_monitor.config(text=" STOP MONITORING", bg="#da3633")
             self.status_label.config(
                 text="MONITORING - Watching for results...", fg=self.GREEN)
-            self._log("Monitoring STARTED — popup presence detection active")
+            self._log("Monitoring STARTED — v16 color-based detection active")
             self._log(f"Popup correlation threshold: {self.popup_correlation_threshold}")
             if self.baseline_crop is not None:
                 self._log("Calibration baseline loaded — will verify popup presence each scan")
@@ -1539,16 +1555,17 @@ class StatsGUI:
 
     def _scan_once(self):
         """
-        v15: Popup-presence-gated detection.
+        v16: Popup-presence-gated detection + color-based identification.
 
         Before trying food detection, checks if the popup is actually visible
         by comparing the crop's background to the calibration baseline.
-        This prevents detecting food icons on the wheel/game UI.
+        When popup is confirmed, uses HSV color histograms (not grayscale
+        template matching) to identify which food is shown.
 
         Steps:
         1. Capture crop at calibrated position
         2. CHECK POPUP PRESENCE (background correlation with baseline)
-        3. Only if popup is present → run food detection + stability checks
+        3. Only if popup is present → run color-based food detection
         4. If no popup → skip (log "No popup")
         """
         if not self.capturer or not self.detector:
@@ -1595,9 +1612,9 @@ class StatsGUI:
         # Save crop for preview (thread-safe: just save reference)
         self.latest_crop = crop.copy()
 
-        # === POPUP PRESENCE CHECK (v15) ===
+        # === POPUP PRESENCE CHECK (v15/v16) ===
         # Compare background of current crop to calibration baseline.
-        # Only proceed with food detection if popup background is present.
+        # Only proceed with color-based food detection if popup is present.
         popup_present, popup_corr = self._check_popup_presence(gray)
         self.last_popup_corr = popup_corr  # For GUI display
 
